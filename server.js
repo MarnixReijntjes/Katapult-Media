@@ -53,6 +53,19 @@ const httpServer = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(healthStatus, null, 2));
     console.log(`[${new Date().toISOString()}] Health check requested`);
+  } else if (req.url === '/twiml' && req.method === 'POST') {
+    // Return TwiML for Twilio voice webhook
+    const websocketUrl = `wss://${req.headers.host}`;
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="${websocketUrl}" />
+    </Connect>
+</Response>`;
+    
+    res.writeHead(200, { 'Content-Type': 'text/xml' });
+    res.end(twiml);
+    console.log(`[${new Date().toISOString()}] TwiML requested for host: ${req.headers.host}`);
   } else {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not Found' }));
