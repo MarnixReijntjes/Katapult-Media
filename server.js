@@ -93,7 +93,7 @@ function handleTwilioConnection(twilioWs, clientId) {
   let isResponseActive = false;
   
   // Connect to OpenAI Realtime API
-  const openaiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17', {
+  const openaiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview', {
     headers: {
       'Authorization': `Bearer ${OPENAI_API_KEY}`,
       'OpenAI-Beta': 'realtime=v1'
@@ -111,7 +111,7 @@ function handleTwilioConnection(twilioWs, clientId) {
     const sessionConfig = {
       type: 'session.update',
       session: {
-        modalities: ['text', 'audio'],
+        modalities: ['audio', 'text'],
         instructions: INSTRUCTIONS,
         voice: VOICE,
         input_audio_format: 'g711_ulaw',
@@ -123,7 +123,8 @@ function handleTwilioConnection(twilioWs, clientId) {
           type: 'server_vad',
           threshold: 0.5,
           prefix_padding_ms: 300,
-          silence_duration_ms: 500
+          silence_duration_ms: 500,
+          create_response: true
         },
         temperature: 0.8,
         max_response_output_tokens: 4096
@@ -139,7 +140,7 @@ function handleTwilioConnection(twilioWs, clientId) {
         const greetingMessage = {
           type: 'response.create',
           response: {
-            modalities: ['text', 'audio'],
+            modalities: ['audio', 'text'],
             instructions: 'Groet de beller warm in het Nederlands en vraag hoe je hen vandaag kunt helpen.',
             voice: VOICE
           }
