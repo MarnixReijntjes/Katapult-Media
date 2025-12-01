@@ -140,7 +140,8 @@ function handleTwilioConnection(twilioWs, clientId) {
           type: 'response.create',
           response: {
             modalities: ['text', 'audio'],
-            instructions: 'Groet de beller warm in het Nederlands en vraag hoe je hen vandaag kunt helpen.'
+            instructions: 'Groet de beller warm in het Nederlands en vraag hoe je hen vandaag kunt helpen.',
+            voice: VOICE
           }
         };
         openaiWs.send(JSON.stringify(greetingMessage));
