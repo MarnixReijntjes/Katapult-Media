@@ -7,7 +7,9 @@ dotenv.config();
 
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+// Supported Realtime API voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
 const VOICE = process.env.VOICE || 'alloy';
+const SPEED = parseFloat(process.env.SPEED || '1.0'); // 0.25 to 4.0
 const INSTRUCTIONS = process.env.INSTRUCTIONS || 'You are Tessa, a helpful and friendly multilingual voice assistant. You can speak both English and Dutch fluently. Automatically detect the language the caller is using and respond in the same language. Speak naturally and conversationally. Help the caller with their questions in a professional and courteous manner. Als de beller Nederlands spreekt, antwoord dan in het Nederlands. If the caller speaks English, respond in English.';
 
 if (!OPENAI_API_KEY) {
@@ -127,7 +129,8 @@ function handleTwilioConnection(twilioWs, clientId) {
           create_response: true
         },
         temperature: 0.8,
-        max_response_output_tokens: 4096
+        max_response_output_tokens: 4096,
+        speed: SPEED
       }
     };
 
@@ -222,6 +225,7 @@ function handleTwilioConnection(twilioWs, clientId) {
         responseStartTimestamp = Date.now();
         audioChunkCount = 0;
         isResponseActive = true;
+        console.log(`[${new Date().toISOString()}] 🎤 New response started - waiting for audio chunks...`);
       }
 
       // Handle response cancellation
@@ -255,6 +259,9 @@ function handleTwilioConnection(twilioWs, clientId) {
 
       // Forward audio responses back to Twilio
       if (event.type === 'response.audio.delta' && event.delta) {
+        audioChunkCount++;
+        console.log(`[${new Date().toISOString()}] 🔊 Audio chunk #${audioChunkCount} received from OpenAI (${event.delta.length} bytes)`);
+        
         const audioPayload = {
           event: 'media',
           streamSid: streamSid,
@@ -265,7 +272,9 @@ function handleTwilioConnection(twilioWs, clientId) {
         
         if (twilioWs.readyState === WebSocket.OPEN) {
           twilioWs.send(JSON.stringify(audioPayload));
-          audioChunkCount++;
+          console.log(`[${new Date().toISOString()}] ✅ Audio chunk #${audioChunkCount} forwarded to Twilio`);
+        } else {
+          console.error(`[${new Date().toISOString()}] ❌ Failed to forward audio chunk #${audioChunkCount} - Twilio WS not open`);
         }
       }
 
@@ -275,8 +284,13 @@ function handleTwilioConnection(twilioWs, clientId) {
       }
 
       if (event.type === 'response.done') {
-        console.log(`[${new Date().toISOString()}] Response completed for call: ${callSid}`);
+        console.log(`[${new Date().toISOString()}] Response completed for call: ${callSid} - Total audio chunks sent: ${audioChunkCount}`);
         isResponseActive = false;
+        
+        // Warn if no audio was received
+        if (audioChunkCount === 0) {
+          console.warn(`[${new Date().toISOString()}] ⚠️ WARNING: Response completed but NO audio chunks were received from OpenAI!`);
+        }
       }
 
       if (event.type === 'error') {
