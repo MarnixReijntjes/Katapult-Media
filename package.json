@@ -20,7 +20,7 @@
   "dependencies": {
     "ws": "^8.18.0",
     "dotenv": "^16.4.5",
-    "twilio": "^5.3.5"
+    "twilio": "^5.3.5",
+    "node-fetch": "^3.3.2"
   }
 }
-
