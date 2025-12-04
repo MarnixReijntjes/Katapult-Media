@@ -1,13 +1,15 @@
 import WebSocket, { WebSocketServer } from 'ws';
 import dotenv from 'dotenv';
 import http from 'http';
-import { EventEmitter } from 'events';
-import fetch from 'node-fetch';
+import twilio from 'twilio';
 
 dotenv.config();
 
+// ---------- Basis config ----------
+
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
 // Supported Realtime API voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
 const VOICE = process.env.VOICE || 'alloy';
 const SPEED = parseFloat(process.env.SPEED || '1.0'); // 0.25 to 4.0
@@ -20,63 +22,24 @@ if (!OPENAI_API_KEY) {
   process.exit(1);
 }
 
-// Trello + Twilio config
-const TRELLO_KEY = process.env.TRELLO_KEY;
-const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
-const TRELLO_LIST_ID = process.env.TRELLO_LIST_ID;
+// ---------- Twilio config ----------
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
-const TWILIO_TWIML_URL = process.env.TWILIO_TWIML_URL;
+const TWILIO_FROM = process.env.TWILIO_FROM; // bijv. +18046703805
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, ''); // bijv. https://test-cb9s.onrender.com
 
-// Outbound call naar Twilio starten
-async function makeOutboundCall(to) {
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER) {
-    console.error('❌ Twilio env vars missing, cannot place outbound call');
-    return;
-  }
-
-  if (!TWILIO_TWIML_URL) {
-    console.error('❌ TWILIO_TWIML_URL is not set, cannot place outbound call');
-    return;
-  }
-
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`;
-
-  const body = new URLSearchParams({
-    To: to,
-    From: TWILIO_FROM_NUMBER,
-    Url: TWILIO_TWIML_URL
-  });
-
-  const auth = Buffer.from(
-    `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
-  ).toString('base64');
-
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Basic ${auth}`,
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
-      body
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      console.error('❌ Twilio outbound call failed', res.status, text);
-    } else {
-      const data = await res.json();
-      console.log('📞 Twilio outbound call created, SID:', data.sid);
-    }
-  } catch (err) {
-    console.error('❌ Error calling Twilio outbound API:', err);
-  }
+let twilioClient = null;
+if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
+  twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+} else {
+  console.warn(
+    '⚠️  TWILIO_ACCOUNT_SID of TWILIO_AUTH_TOKEN ontbreekt. Outbound calls zullen niet werken tot je deze env vars hebt gezet.'
+  );
 }
 
-// Track active connections and server stats
+// ---------- Server statistics ----------
+
 const serverStats = {
   startTime: new Date(),
   totalConnections: 0,
@@ -84,11 +47,50 @@ const serverStats = {
   totalErrors: 0
 };
 
-// Create HTTP server for health checks
+// ---------- Outbound call helper ----------
+
+async function makeOutboundCall(phone) {
+  if (!twilioClient) {
+    throw new Error('Twilio client not configured (missing SID or AUTH TOKEN)');
+  }
+  if (!TWILIO_FROM) {
+    throw new Error('TWILIO_FROM is not set in environment variables');
+  }
+  if (!PUBLIC_BASE_URL) {
+    throw new Error('PUBLIC_BASE_URL is not set in environment variables');
+  }
+
+  const twimlUrl = `${PUBLIC_BASE_URL}/twiml`;
+
+  console.log(`[${new Date().toISOString()}] Creating outbound call to ${phone} from ${TWILIO_FROM}`);
+  const call = await twilioClient.calls.create({
+    to: phone,
+    from: TWILIO_FROM,
+    url: twimlUrl
+  });
+
+  console.log(
+    `[${new Date().toISOString()}] Outbound call created: CallSid=${call.sid}, To=${phone}, TwiML=${twimlUrl}`
+  );
+  return call;
+}
+
+async function triggerCall(phone) {
+  try {
+    console.log(`📞 Triggering Tessa to call ${phone}`);
+    await makeOutboundCall(phone);
+  } catch (e) {
+    console.error('❌ Error triggering outbound call:', e.message);
+    throw e;
+  }
+}
+
+// ---------- HTTP server (health, TwiML, call-test) ----------
+
 const httpServer = http.createServer((req, res) => {
-  // Enable CORS
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS, POST');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   if (req.method === 'OPTIONS') {
@@ -97,10 +99,9 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // Healthcheck
   if (req.url === '/health' && req.method === 'GET') {
-    const uptime = Math.floor(
-      (Date.now() - serverStats.startTime.getTime()) / 1000
-    );
+    const uptime = Math.floor((Date.now() - serverStats.startTime.getTime()) / 1000);
     const healthStatus = {
       status: 'healthy',
       uptime: `${uptime}s`,
@@ -116,47 +117,73 @@ const httpServer = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(healthStatus, null, 2));
     console.log(`[${new Date().toISOString()}] Health check requested`);
-  } else if (req.url === '/twiml' && req.method === 'POST') {
-    // Return TwiML for Twilio voice webhook
+    return;
+  }
+
+  // Twilio voice webhook → geeft TwiML met Media Stream
+  if (req.url === '/twiml' && req.method === 'POST') {
     const websocketUrl = `wss://${req.headers.host}`;
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Connect>
-        <Stream url="${websocketUrl}" />
-    </Connect>
+  <Connect>
+    <Stream url="${websocketUrl}" />
+  </Connect>
 </Response>`;
 
     res.writeHead(200, { 'Content-Type': 'text/xml' });
     res.end(twiml);
-    console.log(
-      `[${new Date().toISOString()}] TwiML requested for host: ${req.headers.host}`
-    );
-  } else {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not Found' }));
+    console.log(`[${new Date().toISOString()}] TwiML requested for host: ${req.headers.host}`);
+    return;
   }
+
+  // Test endpoint → /call-test?phone=06...
+  if (req.url.startsWith('/call-test') && req.method === 'GET') {
+    const urlObj = new URL(req.url, `http://${req.headers.host}`);
+    const phone = urlObj.searchParams.get('phone');
+
+    if (!phone) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          error: 'Missing phone parameter. Use /call-test?phone=0612345678'
+        })
+      );
+      return;
+    }
+
+    console.log(`📞 /call-test triggered for: ${phone}`);
+
+    triggerCall(phone)
+      .then(() => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', calling: phone }));
+      })
+      .catch(err => {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      });
+
+    return;
+  }
+
+  // Fallback 404
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not Found' }));
 });
 
-// Create WebSocket server attached to HTTP server
+// ---------- WebSocket server voor Twilio Media Streams ----------
+
 const wss = new WebSocketServer({ server: httpServer });
 
 httpServer.listen(PORT, () => {
-  console.log(
-    `[${new Date().toISOString()}] Server started on port ${PORT}`
-  );
-  console.log(
-    `[${new Date().toISOString()}] Twilio Media Stream endpoint: wss://localhost:${PORT}`
-  );
-  console.log(
-    `[${new Date().toISOString()}] Health check: http://localhost:${PORT}/health`
-  );
+  console.log(`[${new Date().toISOString()}] Server started on port ${PORT}`);
+  console.log(`[${new Date().toISOString()}] Twilio Media Stream endpoint: wss://localhost:${PORT}`);
+  console.log(`[${new Date().toISOString()}] Health check: http://localhost:${PORT}/health`);
 });
 
-// Handle Twilio-specific WebSocket connections
+// Twilio connection handler
 function handleTwilioConnection(twilioWs, clientId) {
-  console.log(
-    `[${new Date().toISOString()}] Setting up Twilio media stream for: ${clientId}`
-  );
+  console.log(`[${new Date().toISOString()}] Setting up Twilio media stream for: ${clientId}`);
 
   let streamSid = null;
   let callSid = null;
@@ -178,14 +205,12 @@ function handleTwilioConnection(twilioWs, clientId) {
 
   let isOpenAIConnected = false;
 
-  // Handle OpenAI connection open
   openaiWs.on('open', () => {
     console.log(
       `[${new Date().toISOString()}] Connected to OpenAI Realtime API for Twilio call: ${clientId}`
     );
     isOpenAIConnected = true;
 
-    // Configure session for Twilio (mulaw audio)
     const sessionConfig = {
       type: 'session.update',
       session: {
@@ -216,7 +241,7 @@ function handleTwilioConnection(twilioWs, clientId) {
       JSON.stringify(sessionConfig)
     );
 
-    // Send an initial greeting to start the conversation
+    // Eerste begroeting
     setTimeout(() => {
       if (openaiWs.readyState === WebSocket.OPEN) {
         const greetingMessage = {
@@ -236,8 +261,8 @@ function handleTwilioConnection(twilioWs, clientId) {
     }, 250);
   });
 
-  // Handle messages from Twilio
-  twilioWs.on('message', (message) => {
+  // Twilio → OpenAI audio
+  twilioWs.on('message', message => {
     try {
       const msg = JSON.parse(message);
 
@@ -251,11 +276,7 @@ function handleTwilioConnection(twilioWs, clientId) {
           break;
 
         case 'media':
-          // Forward audio from Twilio to OpenAI
-          if (
-            isOpenAIConnected &&
-            openaiWs.readyState === WebSocket.OPEN
-          ) {
+          if (isOpenAIConnected && openaiWs.readyState === WebSocket.OPEN) {
             const audioData = {
               type: 'input_audio_buffer.append',
               audio: msg.media.payload
@@ -274,9 +295,7 @@ function handleTwilioConnection(twilioWs, clientId) {
           break;
 
         default:
-          console.log(
-            `[${new Date().toISOString()}] Twilio event: ${msg.event}`
-          );
+          console.log(`[${new Date().toISOString()}] Twilio event: ${msg.event}`);
       }
     } catch (error) {
       console.error(
@@ -286,31 +305,21 @@ function handleTwilioConnection(twilioWs, clientId) {
     }
   });
 
-  // Handle messages from OpenAI
-  openaiWs.on('message', (data) => {
+  // OpenAI → Twilio audio + events
+  openaiWs.on('message', data => {
     try {
       const event = JSON.parse(data);
 
-      // Log all events for debugging
-      console.log(
-        `[${new Date().toISOString()}] OpenAI event: ${event.type}`
-      );
+      console.log(`[${new Date().toISOString()}] OpenAI event: ${event.type}`);
 
-      // Handle user interruption - cancel ongoing response
       if (event.type === 'input_audio_buffer.speech_started') {
-        console.log(
-          `[${new Date().toISOString()}] User interruption detected`
-        );
+        console.log(`[${new Date().toISOString()}] User interruption detected`);
 
-        // Only cancel if there's an active response
         if (isResponseActive && openaiWs.readyState === WebSocket.OPEN) {
           openaiWs.send(JSON.stringify({ type: 'response.cancel' }));
-          console.log(
-            `[${new Date().toISOString()}] Sent response.cancel`
-          );
+          console.log(`[${new Date().toISOString()}] Sent response.cancel`);
         }
 
-        // Clear Twilio's audio queue
         if (twilioWs.readyState === WebSocket.OPEN && streamSid) {
           twilioWs.send(
             JSON.stringify({
@@ -321,7 +330,6 @@ function handleTwilioConnection(twilioWs, clientId) {
         }
       }
 
-      // Track assistant items for potential truncation
       if (event.type === 'response.output_item.added') {
         lastAssistantItem = event.item;
         responseStartTimestamp = Date.now();
@@ -332,19 +340,13 @@ function handleTwilioConnection(twilioWs, clientId) {
         );
       }
 
-      // Handle response cancellation
       if (event.type === 'response.cancelled') {
         console.log(
           `[${new Date().toISOString()}] Response cancelled - truncating assistant message`
         );
         isResponseActive = false;
 
-        // Truncate the assistant's last message at the interruption point
-        if (
-          lastAssistantItem &&
-          lastAssistantItem.id &&
-          responseStartTimestamp
-        ) {
+        if (lastAssistantItem && lastAssistantItem.id && responseStartTimestamp) {
           const elapsedMs = Date.now() - responseStartTimestamp;
           const audioEndMs = Math.max(0, elapsedMs - 200);
 
@@ -364,7 +366,6 @@ function handleTwilioConnection(twilioWs, clientId) {
         }
       }
 
-      // Forward audio responses back to Twilio
       if (event.type === 'response.audio.delta' && event.delta) {
         audioChunkCount++;
         console.log(
@@ -391,7 +392,6 @@ function handleTwilioConnection(twilioWs, clientId) {
         }
       }
 
-      // Log conversation items for debugging
       if (event.type === 'conversation.item.created') {
         console.log(
           `[${new Date().toISOString()}] Conversation item: ${event.item.type}`
@@ -425,12 +425,9 @@ function handleTwilioConnection(twilioWs, clientId) {
     }
   });
 
-  // Handle Twilio disconnection
   twilioWs.on('close', () => {
     serverStats.activeConnections--;
-    console.log(
-      `[${new Date().toISOString()}] Twilio disconnected: ${clientId}`
-    );
+    console.log(`[${new Date().toISOString()}] Twilio disconnected: ${clientId}`);
     console.log(
       `[${new Date().toISOString()}] Active connections: ${serverStats.activeConnections}`
     );
@@ -440,8 +437,7 @@ function handleTwilioConnection(twilioWs, clientId) {
     }
   });
 
-  // Handle Twilio errors
-  twilioWs.on('error', (error) => {
+  twilioWs.on('error', error => {
     serverStats.totalErrors++;
     console.error(
       `[${new Date().toISOString()}] Twilio WebSocket error (${clientId}):`,
@@ -453,8 +449,7 @@ function handleTwilioConnection(twilioWs, clientId) {
     }
   });
 
-  // Handle OpenAI disconnection
-  openaiWs.on('close', (code) => {
+  openaiWs.on('close', code => {
     console.log(
       `[${new Date().toISOString()}] OpenAI closed for Twilio call ${callSid} (code: ${code})`
     );
@@ -465,8 +460,7 @@ function handleTwilioConnection(twilioWs, clientId) {
     }
   });
 
-  // Handle OpenAI errors
-  openaiWs.on('error', (error) => {
+  openaiWs.on('error', error => {
     serverStats.totalErrors++;
     console.error(
       `[${new Date().toISOString()}] OpenAI error for Twilio call (${clientId}):`,
@@ -480,25 +474,23 @@ function handleTwilioConnection(twilioWs, clientId) {
   });
 }
 
+// ---------- WebSocket events ----------
+
 wss.on('connection', (clientWs, request) => {
   const clientId = `${request.socket.remoteAddress}:${request.socket.remotePort}`;
 
   serverStats.totalConnections++;
   serverStats.activeConnections++;
 
-  console.log(
-    `[${new Date().toISOString()}] New Twilio connection: ${clientId}`
-  );
+  console.log(`[${new Date().toISOString()}] New Twilio connection: ${clientId}`);
   console.log(
     `[${new Date().toISOString()}] Active connections: ${serverStats.activeConnections}`
   );
 
-  // Handle Twilio connection
   handleTwilioConnection(clientWs, clientId);
 });
 
-// Handle server errors
-wss.on('error', (error) => {
+wss.on('error', error => {
   serverStats.totalErrors++;
   console.error(
     `[${new Date().toISOString()}] WebSocket server error:`,
@@ -506,15 +498,13 @@ wss.on('error', (error) => {
   );
 });
 
-httpServer.on('error', (error) => {
-  console.error(
-    `[${new Date().toISOString()}] HTTP server error:`,
-    error.message
-  );
+httpServer.on('error', error => {
+  console.error(`[${new Date().toISOString()}] HTTP server error:`, error.message);
   process.exit(1);
 });
 
-// Graceful shutdown
+// ---------- Graceful shutdown ----------
+
 const shutdown = () => {
   console.log(`\n[${new Date().toISOString()}] Shutting down server...`);
   console.log(
@@ -526,14 +516,11 @@ const shutdown = () => {
 
   wss.close(() => {
     httpServer.close(() => {
-      console.log(
-        `[${new Date().toISOString()}] Server closed gracefully`
-      );
+      console.log(`[${new Date().toISOString()}] Server closed gracefully`);
       process.exit(0);
     });
   });
 
-  // Force close after 10 seconds
   setTimeout(() => {
     console.error(
       `[${new Date().toISOString()}] Forced shutdown after timeout`
@@ -545,12 +532,8 @@ const shutdown = () => {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-// Log unhandled errors
-process.on('uncaughtException', (error) => {
-  console.error(
-    `[${new Date().toISOString()}] Uncaught exception:`,
-    error
-  );
+process.on('uncaughtException', error => {
+  console.error(`[${new Date().toISOString()}] Uncaught exception:`, error);
   process.exit(1);
 });
 
@@ -562,63 +545,3 @@ process.on('unhandledRejection', (reason, promise) => {
     reason
   );
 });
-
-// ----------------------
-// Trello poller
-// ----------------------
-
-async function markCardAsCalled(cardId, prevDesc) {
-  const newDesc = (prevDesc || '') + '\n\ncalled: true';
-
-  await fetch(
-    `https://api.trello.com/1/cards/${cardId}?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`,
-    {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ desc: newDesc })
-    }
-  );
-}
-
-async function triggerCall(phone) {
-  try {
-    console.log('📞 Calling', phone);
-    await makeOutboundCall(phone);
-  } catch (e) {
-    console.error('❌ Error calling number:', e);
-  }
-}
-
-async function pollTrello() {
-  // als Trello-config mist: niet poll’en
-  if (!TRELLO_KEY || !TRELLO_TOKEN || !TRELLO_LIST_ID) {
-    return;
-  }
-
-  try {
-    const res = await fetch(
-      `https://api.trello.com/1/lists/${TRELLO_LIST_ID}/cards?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`
-    );
-    const cards = await res.json();
-
-    for (const card of cards) {
-      if (!card.desc) continue;
-
-      // Skip cards that are already processed
-      if (card.desc.includes('called: true')) continue;
-
-      // Detect number in description (very forgiving regex)
-      const match = card.desc.match(/(\+31|0)\d{8,11}/);
-      if (!match) continue;
-
-      const phone = match[0];
-      await triggerCall(phone);
-      await markCardAsCalled(card.id, card.desc);
-    }
-  } catch (err) {
-    console.error('❌ Trello poller error:', err);
-  }
-}
-
-setInterval(pollTrello, 15000);
-console.log('🔁 Trello poller active (every 15 seconds)...');
