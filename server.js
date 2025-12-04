@@ -400,3 +400,64 @@ process.on('uncaughtException', (error) => {
 process.on('unhandledRejection', (reason, promise) => {
   console.error(`[${new Date().toISOString()}] Unhandled rejection at:`, promise, 'reason:', reason);
 });
+
+import fetch from "node-fetch";
+
+const TRELLO_KEY = process.env.TRELLO_KEY;
+const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
+const TRELLO_LIST_ID = process.env.TRELLO_LIST_ID;
+
+// ---- Helper: call Twilio outbound function ----
+async function triggerCall(phone) {
+  try {
+    console.log("📞 Calling", phone);
+    // Je dev heeft waarschijnlijk iets als twilio.calls.create() al staan:
+    // Pas dit aan naar jouw bestaande functie:
+    await makeOutboundCall(phone);
+  } catch (e) {
+    console.error("❌ Error calling number:", e);
+  }
+}
+
+// ---- Helper: mark card as processed ----
+async function markCardAsCalled(cardId) {
+  await fetch(`https://api.trello.com/1/cards/${cardId}?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      desc: "called: true"
+    })
+  });
+}
+
+// ---- Main poller ----
+async function pollTrello() {
+  try {
+    const res = await fetch(
+      `https://api.trello.com/1/lists/${TRELLO_LIST_ID}/cards?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`
+    );
+    const cards = await res.json();
+
+    for (const card of cards) {
+      if (!card.desc) continue;
+
+      // Skip cards that are already processed
+      if (card.desc.includes("called: true")) continue;
+
+      // Detect number in description (very forgiving regex)
+      const match = card.desc.match(/(\+31|0)\d{8,11}/);
+      if (!match) continue;
+
+      const phone = match[0];
+      await triggerCall(phone);
+      await markCardAsCalled(card.id);
+    }
+  } catch (err) {
+    console.error("❌ Trello poller error:", err);
+  }
+}
+
+// ---- Run every 15s ----
+setInterval(pollTrello, 15000);
+
+console.log("🔁 Trello poller active (every 15 seconds)...");
