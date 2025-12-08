@@ -390,25 +390,7 @@ function handleTwilioConnection(twilioWs, clientId) {
       `[${new Date().toISOString()}] Session config sent:`,
       JSON.stringify(sessionConfig)
     );
-
-    // Eerste begroeting
-    setTimeout(() => {
-      if (openaiWs.readyState === WebSocket.OPEN) {
-        const greetingMessage = {
-          type: 'response.create',
-          response: {
-            modalities: ['audio', 'text'],
-            instructions:
-              'Groet de beller warm in het Nederlands en vraag hoe je hen vandaag kunt helpen.',
-            voice: VOICE
-          }
-        };
-        openaiWs.send(JSON.stringify(greetingMessage));
-        console.log(
-          `[${new Date().toISOString()}] Initial greeting triggered for: ${clientId}`
-        );
-      }
-    }, 250);
+    console.log(`[${new Date().toISOString()}] Waiting for user to speak first - no automatic greeting`);
   });
 
   // Twilio → OpenAI audio
@@ -490,6 +472,14 @@ function handleTwilioConnection(twilioWs, clientId) {
         );
       }
 
+      // Collect transcript text for hangup detection
+      if (event.type === 'response.audio_transcript.delta' && event.delta) {
+        if (!lastAssistantItem.transcript) {
+          lastAssistantItem.transcript = '';
+        }
+        lastAssistantItem.transcript += event.delta.toLowerCase();
+      }
+
       if (event.type === 'response.cancelled') {
         console.log(
           `[${new Date().toISOString()}] Response cancelled - truncating assistant message`
@@ -558,6 +548,38 @@ function handleTwilioConnection(twilioWs, clientId) {
           console.warn(
             `[${new Date().toISOString()}] ⚠️ WARNING: Response completed but NO audio chunks were received from OpenAI!`
           );
+        }
+
+        // Check if assistant indicated end of conversation using collected transcript
+        if (lastAssistantItem && lastAssistantItem.transcript) {
+          const transcriptText = lastAssistantItem.transcript;
+          console.log(`[${new Date().toISOString()}] 📝 Full transcript: "${transcriptText}"`);
+          
+          // Detect conversation-ending phrases
+          const endPhrases = [
+            'goodbye', 'bye', 'dag', 'doei', 'tot ziens',
+            'have a nice day', 'fijne dag', 'prettige dag',
+            'talk to you later', 'speak soon', 'tot later',
+            'have a good day', 'take care', 'pas goed op jezelf',
+            'end call', 'hanging up', 'ophangen'
+          ];
+          
+          const shouldEndCall = endPhrases.some(phrase => transcriptText.includes(phrase));
+          
+          if (shouldEndCall) {
+            console.log(`[${new Date().toISOString()}] 📞 Conversation ending detected - hanging up call in 3 seconds`);
+            
+            // Wait 3 seconds to ensure audio finishes playing
+            setTimeout(() => {
+              if (twilioWs.readyState === WebSocket.OPEN) {
+                console.log(`[${new Date().toISOString()}] 📴 Closing Twilio connection to end call`);
+                twilioWs.close();
+              }
+              if (openaiWs.readyState === WebSocket.OPEN) {
+                openaiWs.close();
+              }
+            }, 3000);
+          }
         }
       }
 
@@ -695,4 +717,3 @@ process.on('unhandledRejection', (reason, promise) => {
     reason
   );
 });
-
