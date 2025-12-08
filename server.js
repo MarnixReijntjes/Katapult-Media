@@ -2,89 +2,69 @@ import WebSocket, { WebSocketServer } from 'ws';
 import dotenv from 'dotenv';
 import http from 'http';
 import twilio from 'twilio';
-import fetch from 'node-fetch';
 
 dotenv.config();
+
+// ======= FORCED GLOBAL FETCH (Render-safe) =======
+let fetch;
+try {
+  fetch = global.fetch || (await import('node-fetch')).default;
+  console.log('✅ fetch loaded');
+} catch (e) {
+  console.error('❌ fetch NOT available:', e.message);
+}
 
 // ---------- Basis config ----------
 
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
 const VOICE = process.env.VOICE || 'alloy';
 const SPEED = parseFloat(process.env.SPEED || '1.0');
-const INSTRUCTIONS =
-  process.env.INSTRUCTIONS ||
-  'You are Tessa, a helpful and friendly multilingual voice assistant. You speak Dutch and English naturally.';
+const INSTRUCTIONS = process.env.INSTRUCTIONS || 'Je bent Tessa.';
 
-if (!OPENAI_API_KEY) {
-  console.error('❌ OPENAI_API_KEY ontbreekt');
-  process.exit(1);
-}
-
-// ---------- Twilio config ----------
-
+// ---------- Twilio ----------
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_FROM = process.env.TWILIO_FROM;
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
 
-let twilioClient = null;
-if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
-  twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-} else {
-  console.warn('⚠️ Twilio credentials ontbreken');
-}
+let twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-// ---------- Trello config ----------
-
+// ---------- Trello ----------
 const TRELLO_KEY = process.env.TRELLO_KEY;
 const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
 const TRELLO_LIST_ID = process.env.TRELLO_LIST_ID;
 
-if (!TRELLO_KEY || !TRELLO_TOKEN || !TRELLO_LIST_ID) {
-  console.error('❌ Trello ENV vars ontbreken');
-}
+console.log('✅ ENV CHECK:', {
+  hasKey: !!TRELLO_KEY,
+  hasToken: !!TRELLO_TOKEN,
+  hasList: !!TRELLO_LIST_ID
+});
 
-// ---------- Server stats ----------
-
-const serverStats = {
-  startTime: new Date(),
-  totalConnections: 0,
-  activeConnections: 0,
-  totalErrors: 0
-};
-
-// ---------- Outbound call helper ----------
-
-async function makeOutboundCall(phone) {
-  if (!twilioClient) throw new Error('Twilio client ontbreekt');
-  if (!TWILIO_FROM) throw new Error('TWILIO_FROM ontbreekt');
-  if (!PUBLIC_BASE_URL) throw new Error('PUBLIC_BASE_URL ontbreekt');
-
-  const twimlUrl = `${PUBLIC_BASE_URL}/twiml`;
-
-  const call = await twilioClient.calls.create({
-    to: phone,
-    from: TWILIO_FROM,
-    url: twimlUrl
-  });
-
-  console.log(`✅ Call gestart naar ${phone} (${call.sid})`);
-  return call;
-}
+// ---------- Outbound call ----------
 
 async function triggerCall(phone) {
-  await makeOutboundCall(phone);
+  console.log('📞 Triggering call to', phone);
+  await twilioClient.calls.create({
+    to: phone,
+    from: TWILIO_FROM,
+    url: `${PUBLIC_BASE_URL}/twiml`
+  });
 }
 
-// ---------- ✅ TRELLO POLLER ----------
+// ---------- ✅ TRELLO POLLER MET HARDE LOGS ----------
 
 async function pollTrelloLeads() {
+  console.log('🔁 Polling Trello...');
+
   try {
     const url = `https://api.trello.com/1/lists/${TRELLO_LIST_ID}/cards?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
     const res = await fetch(url);
+
+    console.log('📡 Trello status:', res.status);
+
     const cards = await res.json();
+    console.log(`📋 ${cards.length} kaarten gevonden`);
 
     for (const card of cards) {
       const hasCalled = card.labels.some(l => l.name === 'GEBELD');
@@ -94,7 +74,7 @@ async function pollTrelloLeads() {
       if (!match) continue;
 
       const phone = match[0];
-      console.log(`📞 Trello trigger: ${phone}`);
+      console.log('📞 Trello trigger:', phone);
 
       await triggerCall(phone);
 
@@ -104,20 +84,18 @@ async function pollTrelloLeads() {
         body: JSON.stringify({ name: 'GEBELD', color: 'green' })
       });
 
-      console.log(`✅ Label GEBELD gezet op kaart ${card.id}`);
+      console.log('✅ GEBELD gezet op', card.id);
     }
   } catch (e) {
-    console.error('❌ Trello poll fout:', e.message);
+    console.error('❌ POLLER ERROR:', e.message);
   }
 }
 
 setInterval(pollTrelloLeads, 15000);
 
-// ---------- HTTP server ----------
+// ---------- HTTP ----------
 
 const httpServer = http.createServer((req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-
   if (req.url === '/health') {
     res.writeHead(200);
     res.end('OK');
@@ -141,67 +119,13 @@ const httpServer = http.createServer((req, res) => {
   res.end();
 });
 
-// ---------- WebSocket server ----------
+// ---------- WS ----------
 
 const wss = new WebSocketServer({ server: httpServer });
+wss.on('connection', ws => {});
+
+// ---------- START ----------
 
 httpServer.listen(PORT, () => {
-  console.log(`✅ Server gestart op poort ${PORT}`);
+  console.log(`✅ Server gestart op ${PORT}`);
 });
-
-// ---------- Twilio handler ----------
-
-function handleTwilioConnection(twilioWs) {
-  const openaiWs = new WebSocket(
-    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1'
-      }
-    }
-  );
-
-  openaiWs.on('open', () => {
-    const sessionConfig = {
-      type: 'session.update',
-      session: {
-        modalities: ['audio', 'text'],
-        instructions: INSTRUCTIONS,
-        voice: VOICE,
-        input_audio_format: 'g711_ulaw',
-        output_audio_format: 'g711_ulaw',
-        temperature: 0.8,
-        speed: SPEED
-      }
-    };
-    openaiWs.send(JSON.stringify(sessionConfig));
-  });
-
-  twilioWs.on('message', message => {
-    const msg = JSON.parse(message);
-    if (msg.event === 'media') {
-      openaiWs.send(
-        JSON.stringify({
-          type: 'input_audio_buffer.append',
-          audio: msg.media.payload
-        })
-      );
-    }
-  });
-
-  openaiWs.on('message', data => {
-    const event = JSON.parse(data);
-    if (event.type === 'response.audio.delta') {
-      twilioWs.send(
-        JSON.stringify({
-          event: 'media',
-          streamSid: null,
-          media: { payload: event.delta }
-        })
-      );
-    }
-  });
-}
-
-wss.on('connection', handleTwilioConnection);
