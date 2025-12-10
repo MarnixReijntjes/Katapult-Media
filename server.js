@@ -568,20 +568,36 @@ function handleTwilioConnection(twilioWs, clientId) {
           
           const shouldEndCall = endPhrases.some(phrase => transcriptText.includes(phrase));
           
-          if (shouldEndCall) {
-            console.log(`[${new Date().toISOString()}] 📞 Conversation ending detected - hanging up call in 3 seconds`);
-            
-            // Wait 3 seconds to ensure audio finishes playing
-            setTimeout(() => {
-              if (twilioWs.readyState === WebSocket.OPEN) {
-                console.log(`[${new Date().toISOString()}] 📴 Closing Twilio connection to end call`);
-                twilioWs.close();
-              }
-              if (openaiWs.readyState === WebSocket.OPEN) {
-                openaiWs.close();
-              }
-            }, 3000);
-          }
+if (shouldEndCall && !isResponseActive) {
+  console.log(`[${new Date().toISOString()}] 👋 End intent detected - letting Tessa say goodbye first`);
+
+  const farewellMessage = {
+    type: 'response.create',
+    response: {
+      modalities: ['audio', 'text'],
+      instructions: 'Dank je wel voor het gesprek en een hele fijne dag gewenst. Tot ziens!',
+      voice: VOICE
+    }
+  };
+
+  if (openaiWs.readyState === WebSocket.OPEN) {
+    openaiWs.send(JSON.stringify(farewellMessage));
+  }
+
+  // Pas disconnecten NA de farewell audio
+  setTimeout(() => {
+    console.log(`[${new Date().toISOString()}] 📴 Graceful hangup after goodbye`);
+
+    if (twilioWs.readyState === WebSocket.OPEN) {
+      twilioWs.close();
+    }
+
+    if (openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.close();
+    }
+  }, 5000);
+}
+
         }
       }
 
@@ -719,3 +735,4 @@ process.on('unhandledRejection', (reason, promise) => {
     reason
   );
 });
+
