@@ -559,12 +559,14 @@ function handleTwilioConnection(twilioWs, clientId) {
           
           // Detect conversation-ending phrases
           const endPhrases = [
-            'goodbye', 'bye', 'dag', 'doei', 'tot ziens',
-            'have a nice day', 'fijne dag', 'prettige dag',
-            'talk to you later', 'speak soon', 'tot later',
-            'have a good day', 'take care', 'pas goed op jezelf',
-            'end call', 'hanging up', 'ophangen'
-          ];
+  'fijne dag verder, tot ziens',
+  'dank u wel voor het gesprek, tot ziens',
+  'we spreken elkaar later, tot ziens',
+  'ik ga nu ophangen, tot ziens',
+  'goodbye and have a nice day',
+  'thanks for the call, goodbye',
+  'i will hang up now, goodbye'
+];
           
           const shouldEndCall = endPhrases.some(phrase => transcriptText.includes(phrase));
           
@@ -735,4 +737,5 @@ process.on('unhandledRejection', (reason, promise) => {
     reason
   );
 });
+
 
