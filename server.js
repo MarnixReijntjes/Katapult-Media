@@ -15,9 +15,34 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 // Supported Realtime API voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
 const VOICE = process.env.VOICE || 'alloy';
 const SPEED = parseFloat(process.env.SPEED || '1.0'); // 0.25 to 4.0
+
 const INSTRUCTIONS =
   process.env.INSTRUCTIONS ||
-  'You are Tessa, a helpful and friendly multilingual voice assistant. You can speak both English and Dutch fluently. Automatically detect the language the caller is using and respond in the same language. Speak naturally and conversationally. Help the caller with their questions in a professional and courteous manner. Als de beller Nederlands spreekt, antwoord dan in het Nederlands. If the caller speaks English, respond in English.';
+  [
+    'You are Tessa, a professional outbound phone agent calling business leads.',
+    'Your main goal is to quickly understand the situation and, where relevant, schedule a concrete appointment or callback for our sales team.',
+    '',
+    'Language:',
+    '- You speak Dutch and English fluently.',
+    '- Automatically detect whether the other person speaks Dutch or English and reply in that language.',
+    '',
+    'Style:',
+    '- Be short, clear and businesslike, but still friendly.',
+    '- Prefer 1–2 short sentences per turn, suitable for a normal telephone line.',
+    '- Avoid long stories, jargon and small talk unless the other person explicitly asks for it.',
+    '',
+    'Call structure (outbound sales/appointment):',
+    '1) Briefly introduce yourself and the company.',
+    '2) Check if this is a good moment to talk.',
+    '3) Ask a few focused qualification questions.',
+    '4) Propose a specific appointment time or clear next step (e.g. a callback).',
+    '5) Confirm the key details concisely.',
+    '',
+    'When the conversation is clearly finished and no further questions are asked, close the call with a short farewell and do NOT start a new topic.',
+    'Use one of these clear farewells:',
+    '- In Dutch: "Dank u wel, fijne dag, tot ziens."',
+    '- In English: "Thank you, have a nice day, goodbye."'
+  ].join(' ');
 
 if (!OPENAI_API_KEY) {
   console.error('Error: OPENAI_API_KEY is not set in environment variables');
@@ -357,6 +382,61 @@ function handleTwilioConnection(twilioWs, clientId) {
 
   let isOpenAIConnected = false;
 
+  // ---------- Hang-up state (assistant goodbye + 3s silence) ----------
+  const SILENCE_AFTER_GOODBYE_MS = 3000; // 3 seconden stilte na afscheid
+  let hangupTimer = null;
+
+  // Deze phrases definiëren "gedag zeggen". We checken of ze aan het einde van de utterance staan.
+  const farewellPhrases = [
+    'tot ziens',
+    'fijne dag, tot ziens',
+    'fijne dag verder, tot ziens',
+    'dank u wel, fijne dag, tot ziens',
+    'dank je wel, fijne dag, tot ziens',
+    'goodbye',
+    'have a nice day, goodbye',
+    'thank you, have a nice day, goodbye'
+  ];
+
+  function clearHangupTimer() {
+    if (hangupTimer) {
+      clearTimeout(hangupTimer);
+      hangupTimer = null;
+      console.log(
+        `[${new Date().toISOString()}] ⏱️  Cleared pending hang-up timer (conversation continues)`
+      );
+    }
+  }
+
+  function endCall(reason) {
+    console.log(
+      `[${new Date().toISOString()}] 📴 Ending call ${callSid || ''} - reason: ${reason}`
+    );
+    clearHangupTimer();
+
+    if (twilioWs.readyState === WebSocket.OPEN) {
+      twilioWs.close();
+    }
+
+    if (openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.close();
+    }
+  }
+
+  function scheduleHangupAfterGoodbye() {
+    clearHangupTimer();
+    hangupTimer = setTimeout(() => {
+      console.log(
+        `[${new Date().toISOString()}] ⏱️  Silence after assistant farewell (${SILENCE_AFTER_GOODBYE_MS}ms) - ending call`
+      );
+      endCall('assistant_goodbye_and_silence');
+    }, SILENCE_AFTER_GOODBYE_MS);
+
+    console.log(
+      `[${new Date().toISOString()}] ⏱️  Scheduled hang-up in ${SILENCE_AFTER_GOODBYE_MS}ms after assistant farewell`
+    );
+  }
+
   openaiWs.on('open', () => {
     console.log(
       `[${new Date().toISOString()}] Connected to OpenAI Realtime API for Twilio call: ${clientId}`
@@ -449,6 +529,9 @@ function handleTwilioConnection(twilioWs, clientId) {
       if (event.type === 'input_audio_buffer.speech_started') {
         console.log(`[${new Date().toISOString()}] User interruption detected`);
 
+        // Zodra de beller weer praat, geen automatisch ophangen meer op basis van het vorige afscheid
+        clearHangupTimer();
+
         if (isResponseActive && openaiWs.readyState === WebSocket.OPEN) {
           openaiWs.send(JSON.stringify({ type: 'response.cancel' }));
           console.log(`[${new Date().toISOString()}] Sent response.cancel`);
@@ -465,6 +548,9 @@ function handleTwilioConnection(twilioWs, clientId) {
       }
 
       if (event.type === 'response.output_item.added') {
+        // Nieuwe utterance = gesprek gaat weer verder → hang-up timer van vorige afscheid annuleren
+        clearHangupTimer();
+
         lastAssistantItem = event.item;
         responseStartTimestamp = Date.now();
         audioChunkCount = 0;
@@ -552,54 +638,37 @@ function handleTwilioConnection(twilioWs, clientId) {
           );
         }
 
-        // Check if assistant indicated end of conversation using collected transcript
         if (lastAssistantItem && lastAssistantItem.transcript) {
-          const transcriptText = lastAssistantItem.transcript;
-          console.log(`[${new Date().toISOString()}] 📝 Full transcript: "${transcriptText}"`);
-          
-          // Detect conversation-ending phrases
-          const endPhrases = [
-  'fijne dag verder, tot ziens',
-  'dank u wel voor het gesprek, tot ziens',
-  'we spreken elkaar later, tot ziens',
-  'ik ga nu ophangen, tot ziens',
-  'goodbye and have a nice day',
-  'thanks for the call, goodbye',
-  'i will hang up now, goodbye'
-];
-          
-          const shouldEndCall = endPhrases.some(phrase => transcriptText.includes(phrase));
-          
-if (shouldEndCall && !isResponseActive) {
-  console.log(`[${new Date().toISOString()}] 👋 End intent detected - letting Tessa say goodbye first`);
+          const transcriptText = lastAssistantItem.transcript.trim();
+          const lower = transcriptText.toLowerCase();
 
-  const farewellMessage = {
-    type: 'response.create',
-    response: {
-      modalities: ['audio', 'text'],
-      instructions: 'Dank je wel voor het gesprek en een hele fijne dag gewenst. Tot ziens!',
-      voice: VOICE
-    }
-  };
+          console.log(
+            `[${new Date().toISOString()}] 📝 Full assistant transcript: "${transcriptText}"`
+          );
 
-  if (openaiWs.readyState === WebSocket.OPEN) {
-    openaiWs.send(JSON.stringify(farewellMessage));
-  }
+          // Alleen als een afscheid ZICHTBAAR aan het EINDE staat, starten we de 3s stilte-timer
+          const hasFarewellAtEnd = farewellPhrases.some(phrase => {
+            const lp = phrase.toLowerCase();
+            const idx = lower.lastIndexOf(lp);
+            if (idx === -1) return false;
 
-  // Pas disconnecten NA de farewell audio
-  setTimeout(() => {
-    console.log(`[${new Date().toISOString()}] 📴 Graceful hangup after goodbye`);
+            const after = lower.slice(idx + lp.length).trim();
+            // Alleen niets of simpele interpunctie na de afscheidszin toestaan
+            return after === '' || /^[.!?"']+$/.test(after);
+          });
 
-    if (twilioWs.readyState === WebSocket.OPEN) {
-      twilioWs.close();
-    }
-
-    if (openaiWs.readyState === WebSocket.OPEN) {
-      openaiWs.close();
-    }
-  }, 5000);
-}
-
+          if (hasFarewellAtEnd) {
+            console.log(
+              `[${new Date().toISOString()}] 📞 Assistant farewell detected at end of utterance - waiting for ${SILENCE_AFTER_GOODBYE_MS}ms of silence before hanging up`
+            );
+            scheduleHangupAfterGoodbye();
+          } else {
+            // Geen duidelijke afsluiting → eventuele oude timer weghalen
+            clearHangupTimer();
+          }
+        } else {
+          // Geen transcript = geen basis om op te hangen
+          clearHangupTimer();
         }
       }
 
@@ -624,6 +693,8 @@ if (shouldEndCall && !isResponseActive) {
       `[${new Date().toISOString()}] Active connections: ${serverStats.activeConnections}`
     );
 
+    clearHangupTimer();
+
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.close();
     }
@@ -636,6 +707,8 @@ if (shouldEndCall && !isResponseActive) {
       error.message
     );
 
+    clearHangupTimer();
+
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.close();
     }
@@ -646,6 +719,8 @@ if (shouldEndCall && !isResponseActive) {
       `[${new Date().toISOString()}] OpenAI closed for Twilio call ${callSid} (code: ${code})`
     );
     isOpenAIConnected = false;
+
+    clearHangupTimer();
 
     if (twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.close();
@@ -659,6 +734,8 @@ if (shouldEndCall && !isResponseActive) {
       error.message
     );
     isOpenAIConnected = false;
+
+    clearHangupTimer();
 
     if (twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.close();
@@ -737,5 +814,3 @@ process.on('unhandledRejection', (reason, promise) => {
     reason
   );
 });
-
-
