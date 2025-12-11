@@ -597,26 +597,19 @@ function handleTwilioConnection(twilioWs, clientId) {
 
   // ffmpeg realtime DSP-proces: PCM16 (16k) -> DSP -> 8kHz pcm_mulaw
   const ffmpegArgs = [
-    '-f',
-    's16le',
-    '-ar',
-    '16000',
-    '-ac',
-    '1',
-    '-i',
-    'pipe:0',
-    '-af',
-    'highpass=f=300, lowpass=f=3400, equalizer=f=2700:t=q:w=2:g=6, compand=attacks=0:decays=0:points=-80/-80|-12/-3|0/-3, dynaudnorm',
-    '-ar',
-    '8000',
-    '-ac',
-    '1',
-    '-c:a',
-    'pcm_mulaw',
-    '-f',
-    'mulaw',
-    'pipe:1'
-  ];
+  '-f', 's16le',
+  '-ar', '16000',
+  '-ac', '1',
+  '-i', 'pipe:0',
+  '-af',
+  // pitch +10% (asetrate+atempo) + telefoon-EQ
+  'asetrate=17600,atempo=0.9091,highpass=f=300,lowpass=f=3400,equalizer=f=3000:t=q:w=2:g=4,compand=attacks=0:decays=0:points=-80/-80|-20/-6|0/-3,dynaudnorm',
+  '-ar', '8000',
+  '-ac', '1',
+  '-c:a', 'pcm_mulaw',
+  '-f', 'mulaw',
+  'pipe:1'
+];
 
   const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
   let mulawBuffer = Buffer.alloc(0);
@@ -1016,3 +1009,4 @@ process.on('unhandledRejection', (reason, promise) => {
     reason
   );
 });
+
