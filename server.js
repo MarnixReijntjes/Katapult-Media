@@ -740,7 +740,7 @@ function handleTwilioConnection(twilioWs, clientId) {
       return;
     }
 
-    // MINI-STAP: log alle OpenAI events raw
+    // RAW logging van alle OpenAI events
     console.log(
       `[${new Date().toISOString()}] OpenAI RAW event:`,
       event.type,
@@ -774,13 +774,17 @@ function handleTwilioConnection(twilioWs, clientId) {
       return;
     }
 
-    if (event.type === 'response.output_text.delta') {
-      currentAssistantText += event.delta;
+    // HIER WAS DE BUG: output_text.* → text.*
+    if (event.type === 'response.text.delta') {
+      if (typeof event.delta === 'string') {
+        currentAssistantText += event.delta;
+      }
       return;
     }
 
-    if (event.type === 'response.output_text.done') {
-      const text = currentAssistantText.trim();
+    if (event.type === 'response.text.done') {
+      // gebruik event.text als die er is, anders de accumulator
+      const text = (event.text || currentAssistantText).trim();
       currentAssistantText = '';
 
       if (!text) return;
