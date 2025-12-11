@@ -2,7 +2,7 @@ import WebSocket, { WebSocketServer } from 'ws';
 import dotenv from 'dotenv';
 import http from 'http';
 import twilio from 'twilio';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -87,10 +87,10 @@ async function synthesizeWithElevenLabs(text) {
   return Buffer.from(arrayBuf);
 }
 
-// ---------- OpenAI TTS + DSP voor telefoon ----------
+// ---------- OpenAI TTS + DSP voor telefoon (offline demo) ----------
 
 /**
- * Genereert TTS via OpenAI (alloy) als raw audio (meestal mp3).
+ * Genereert TTS via OpenAI (alloy) als raw audio (mp3/wav).
  */
 async function generateOpenAITTS(text) {
   const resp = await fetch('https://api.openai.com/v1/audio/speech', {
@@ -115,8 +115,8 @@ async function generateOpenAITTS(text) {
 }
 
 /**
- * Past telefoon-DSP toe en zet om naar 8 kHz μ-law (G.711) wav.
- * Resultaat klinkt veel beter over PSTN.
+ * Past telefoon-DSP toe en zet om naar 8 kHz pcm_mulaw wav.
+ * Resultaat klinkt beter over PSTN.
  */
 function applyPhoneDSP(inputBuf, outPath) {
   return new Promise((resolve, reject) => {
@@ -139,7 +139,9 @@ function applyPhoneDSP(inputBuf, outPath) {
     ];
 
     execFile('ffmpeg', args, err => {
-      try { fs.unlinkSync(tempIn); } catch (_) {}
+      try {
+        fs.unlinkSync(tempIn);
+      } catch (_) {}
 
       if (err) {
         console.error('❌ ffmpeg error in applyPhoneDSP:', err.message);
@@ -200,7 +202,7 @@ function normalizePhone(raw) {
 
   // NL mobiel: 06xxxxxxxx (10 cijfers) -> +316xxxxxxxx
   if (digitsOnly.length === 10 && digitsOnly.startsWith('06')) {
-    const withoutZero = digitsOnly.slice(1); // strip leading 0
+    const withoutZero = digitsOnly.slice(1);
     const e164 = `+31${withoutZero}`;
     console.log(`🔄 Normalized NL mobile ${raw} -> ${e164}`);
     return e164;
@@ -271,9 +273,7 @@ async function triggerCall(phoneRaw) {
 // ---------- Trello poller ----------
 
 async function pollTrelloLeads() {
-  if (!TRELLO_KEY || !TRELLO_TOKEN || !TRELLO_LIST_ID) {
-    return;
-  }
+  if (!TRELLO_KEY || !TRELLO_TOKEN || !TRELLO_LIST_ID) return;
 
   console.log('🔁 Polling Trello list for new leads...');
 
@@ -297,8 +297,6 @@ async function pollTrelloLeads() {
       if (hasCalled) continue;
 
       const desc = card.desc || '';
-
-      // Pak telefoonnummer inclusief spaties, streepjes, haakjes
       const match = desc.match(/(\+?[0-9][0-9()\-\s]{7,20})/);
 
       if (!match) {
@@ -313,11 +311,9 @@ async function pollTrelloLeads() {
         await triggerCall(phoneRaw);
       } catch (err) {
         console.error(`❌ Call failed for card ${card.id}:`, err.message);
-        // Geen label zetten bij mislukte call
         continue;
       }
 
-      // Zet label GEBELD zodat we nooit dubbel bellen
       const labelUrl = `https://api.trello.com/1/cards/${card.id}/labels?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
       const labelRes = await fetch(labelUrl, {
         method: 'POST',
@@ -337,7 +333,6 @@ async function pollTrelloLeads() {
   }
 }
 
-// elke 15 seconden pollen
 setInterval(pollTrelloLeads, 15000);
 
 // ---------- HTTP server (health, TwiML, tests, TTS-demo) ----------
@@ -588,7 +583,7 @@ httpServer.listen(PORT, () => {
   console.log(`[${new Date().toISOString()}] Health check: http://localhost:${PORT}/health`);
 });
 
-// Twilio connection handler
+// Twilio connection handler met realtime DSP
 
 function handleTwilioConnection(twilioWs, clientId) {
   console.log(`[${new Date().toISOString()}] Setting up Twilio media stream for: ${clientId}`);
@@ -599,6 +594,81 @@ function handleTwilioConnection(twilioWs, clientId) {
   let responseStartTimestamp = null;
   let audioChunkCount = 0;
   let isResponseActive = false;
+
+  // ffmpeg realtime DSP-proces: PCM16 (16k) -> DSP -> 8kHz pcm_mulaw
+  const ffmpegArgs = [
+    '-f',
+    's16le',
+    '-ar',
+    '16000',
+    '-ac',
+    '1',
+    '-i',
+    'pipe:0',
+    '-af',
+    'highpass=f=300, lowpass=f=3400, equalizer=f=2700:t=q:w=2:g=6, compand=attacks=0:decays=0:points=-80/-80|-12/-3|0/-3, dynaudnorm',
+    '-ar',
+    '8000',
+    '-ac',
+    '1',
+    '-c:a',
+    'pcm_mulaw',
+    '-f',
+    'mulaw',
+    'pipe:1'
+  ];
+
+  const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
+  let mulawBuffer = Buffer.alloc(0);
+
+  ffmpegProc.stderr.on('data', data => {
+    // Debugging evt:
+    // console.log(`[ffmpeg ${clientId}]`, data.toString());
+  });
+
+  ffmpegProc.on('error', err => {
+    serverStats.totalErrors++;
+    console.error(`[${new Date().toISOString()}] ffmpeg realtime error (${clientId}):`, err.message);
+  });
+
+  ffmpegProc.on('close', code => {
+    console.log(
+      `[${new Date().toISOString()}] ffmpeg realtime closed for ${clientId} with code ${code}`
+    );
+  });
+
+  // Alles wat uit ffmpeg komt is mulaw op 8 kHz -> naar Twilio
+  ffmpegProc.stdout.on('data', data => {
+    if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
+
+    mulawBuffer = Buffer.concat([mulawBuffer, data]);
+
+    const frameSize = 160; // 20ms @ 8000 Hz mono, 1 byte/sample (mulaw)
+    while (mulawBuffer.length >= frameSize) {
+      const frame = mulawBuffer.subarray(0, frameSize);
+      mulawBuffer = mulawBuffer.subarray(frameSize);
+
+      const payload = frame.toString('base64');
+      const audioPayload = {
+        event: 'media',
+        streamSid,
+        media: { payload }
+      };
+
+      twilioWs.send(JSON.stringify(audioPayload));
+    }
+  });
+
+  function cleanupRealtime() {
+    if (ffmpegProc && !ffmpegProc.killed) {
+      try {
+        ffmpegProc.stdin.end();
+      } catch (_) {}
+      try {
+        ffmpegProc.kill('SIGTERM');
+      } catch (_) {}
+    }
+  }
 
   // Connect to OpenAI Realtime API
   const openaiWs = new WebSocket(
@@ -625,8 +695,9 @@ function handleTwilioConnection(twilioWs, clientId) {
         modalities: ['audio', 'text'],
         instructions: INSTRUCTIONS,
         voice: VOICE,
-        input_audio_format: 'g711_ulaw',
-        output_audio_format: 'g711_ulaw',
+        input_audio_format: 'g711_ulaw', // van Twilio binnenkomend
+        output_audio_format: 'pcm16',     // high quality naar ons
+        output_audio_sample_rate: 16000,
         input_audio_transcription: {
           model: 'whisper-1'
         },
@@ -700,6 +771,7 @@ function handleTwilioConnection(twilioWs, clientId) {
           if (openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.close();
           }
+          cleanupRealtime();
           break;
 
         default:
@@ -713,7 +785,7 @@ function handleTwilioConnection(twilioWs, clientId) {
     }
   });
 
-  // OpenAI → Twilio audio + events
+  // OpenAI → Twilio audio + events (nu via ffmpeg DSP)
   openaiWs.on('message', data => {
     try {
       const event = JSON.parse(data);
@@ -732,7 +804,7 @@ function handleTwilioConnection(twilioWs, clientId) {
           twilioWs.send(
             JSON.stringify({
               event: 'clear',
-              streamSid: streamSid
+              streamSid
             })
           );
         }
@@ -777,26 +849,13 @@ function handleTwilioConnection(twilioWs, clientId) {
       if (event.type === 'response.audio.delta' && event.delta) {
         audioChunkCount++;
         console.log(
-          `[${new Date().toISOString()}] 🔊 Audio chunk #${audioChunkCount} received from OpenAI (${event.delta.length} bytes)`
+          `[${new Date().toISOString()}] 🔊 PCM16 audio chunk #${audioChunkCount} from OpenAI`
         );
 
-        const audioPayload = {
-          event: 'media',
-          streamSid: streamSid,
-          media: {
-            payload: event.delta
-          }
-        };
-
-        if (twilioWs.readyState === WebSocket.OPEN) {
-          twilioWs.send(JSON.stringify(audioPayload));
-          console.log(
-            `[${new Date().toISOString()}] ✅ Audio chunk #${audioChunkCount} forwarded to Twilio`
-          );
-        } else {
-          console.error(
-            `[${new Date().toISOString()}] ❌ Failed to forward audio chunk #${audioChunkCount} - Twilio WS not open`
-          );
+        // event.delta is base64-encoded PCM16 (16kHz, mono)
+        const pcmBuf = Buffer.from(event.delta, 'base64');
+        if (ffmpegProc && !ffmpegProc.killed) {
+          ffmpegProc.stdin.write(pcmBuf);
         }
       }
 
@@ -808,7 +867,7 @@ function handleTwilioConnection(twilioWs, clientId) {
 
       if (event.type === 'response.done') {
         console.log(
-          `[${new Date().toISOString()}] Response completed for call: ${callSid} - Total audio chunks sent: ${audioChunkCount}`
+          `[${new Date().toISOString()}] Response completed for call: ${callSid} - Total PCM chunks: ${audioChunkCount}`
         );
         isResponseActive = false;
 
@@ -843,6 +902,7 @@ function handleTwilioConnection(twilioWs, clientId) {
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.close();
     }
+    cleanupRealtime();
   });
 
   twilioWs.on('error', error => {
@@ -855,6 +915,7 @@ function handleTwilioConnection(twilioWs, clientId) {
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.close();
     }
+    cleanupRealtime();
   });
 
   openaiWs.on('close', code => {
@@ -866,6 +927,7 @@ function handleTwilioConnection(twilioWs, clientId) {
     if (twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.close();
     }
+    cleanupRealtime();
   });
 
   openaiWs.on('error', error => {
@@ -879,6 +941,7 @@ function handleTwilioConnection(twilioWs, clientId) {
     if (twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.close();
     }
+    cleanupRealtime();
   });
 }
 
@@ -953,4 +1016,3 @@ process.on('unhandledRejection', (reason, promise) => {
     reason
   );
 });
-
