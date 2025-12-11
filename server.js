@@ -1,5 +1,5 @@
 // ============================================================
-//  server.js — Nieuwe Tessa: Realtime NLU → TTS → Telefoon
+//  server.js — Nieuwe Tessa (Realtime NLU → TTS → Twilio)
 // ============================================================
 
 import dotenv from "dotenv";
@@ -27,6 +27,7 @@ const TWILIO_FROM = process.env.TWILIO_FROM;
 if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 if (!PUBLIC_BASE_URL) throw new Error("Missing PUBLIC_BASE_URL");
 
+// Twilio client
 let twilioClient = null;
 if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
   twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
@@ -35,17 +36,16 @@ if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
 // Voice persona
 const INSTRUCTIONS = `
 You are Tessa, a natural Dutch female AI assistant.
-Default language: Dutch.
-If the caller speaks English, switch automatically.
-Keep answers short and natural.
+Default Dutch unless caller speaks English.
+Keep responses short and natural.
 `;
 
 // ------------------------------------------------------------
-// OPENAI TTS → MP3
+// OPENAI TTS
 // ------------------------------------------------------------
 
 async function generateTTS(text) {
-  console.log("🎤 GENERATING TTS:", text);
+  console.log("🎤 TTS:", text);
   const res = await fetch("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: {
@@ -67,12 +67,11 @@ async function generateTTS(text) {
   }
 
   const buf = Buffer.from(await res.arrayBuffer());
-  console.log("🎤 MP3 SIZE:", buf.length);
   return buf;
 }
 
 // ------------------------------------------------------------
-// DSP → μ-law (8kHz)
+// MP3 → μ-law (8kHz)
 // ------------------------------------------------------------
 
 async function convertToPhoneMulaw(inputMp3Buffer) {
@@ -94,47 +93,37 @@ async function convertToPhoneMulaw(inputMp3Buffer) {
   return new Promise((resolve, reject) => {
     execFile("ffmpeg", args, (err) => {
       try { fs.unlinkSync(tmpIn); } catch {}
-      if (err) {
-        console.error("❌ ffmpeg:", err.message);
-        return reject(err);
-      }
+      if (err) return reject(err);
       const out = fs.readFileSync(tmpOut);
       try { fs.unlinkSync(tmpOut); } catch {}
-      console.log("🎧 MULAW SIZE:", out.length);
       resolve(out);
     });
   });
 }
 
 // ------------------------------------------------------------
-// μ-law → Twilio Media Stream
+// Send μ-law audio → Twilio
 // ------------------------------------------------------------
 
 function sendMulawToTwilio(ws, streamSid, mulawBuffer) {
-  const frameSize = 160; // 20ms
-  console.log("📡 SENDING MULAW:", mulawBuffer.length);
+  const frame = 160;
 
-  for (let off = 0; off < mulawBuffer.length; off += frameSize) {
-    const frame = mulawBuffer.subarray(off, off + frameSize);
-    if (!frame.length) continue;
+  for (let i = 0; i < mulawBuffer.length; i += frame) {
+    const chunk = mulawBuffer.subarray(i, i + frame);
+    if (!chunk.length) continue;
 
-    const payload = frame.toString("base64");
-    const packet = {
+    if (ws.readyState !== WebSocket.OPEN) return;
+
+    ws.send(JSON.stringify({
       event: "media",
       streamSid,
-      media: { payload }
-    };
-
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(packet));
-    }
+      media: { payload: chunk.toString("base64") }
+    }));
   }
-
-  console.log("📡 DONE");
 }
 
 // ------------------------------------------------------------
-// Telefoonnummer normalisatie (NL)
+// Phone normalization
 // ------------------------------------------------------------
 
 function normalizePhone(raw) {
@@ -152,7 +141,7 @@ function normalizePhone(raw) {
 }
 
 // ------------------------------------------------------------
-// Outbound call
+// Start outbound call
 // ------------------------------------------------------------
 
 async function startOutboundCall(num) {
@@ -169,27 +158,24 @@ async function startOutboundCall(num) {
 }
 
 // ------------------------------------------------------------
-// HTTP + TwiML
+// HTTP server + TwiML
 // ------------------------------------------------------------
 
-const httpServer = http.createServer(async (req, res) => {
+const httpServer = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true }));
-    return;
+    return res.end(JSON.stringify({ ok: true }));
   }
 
   if (req.url === "/twiml" && req.method === "POST") {
-    const wsUrl = `wss://${req.headers.host}`;
     const xml = `
 <Response>
   <Connect>
-    <Stream url="${wsUrl}" />
+    <Stream url="wss://${req.headers.host}" />
   </Connect>
 </Response>`;
     res.writeHead(200, { "Content-Type": "text/xml" });
-    res.end(xml);
-    return;
+    return res.end(xml);
   }
 
   res.writeHead(404, { "Content-Type": "application/json" });
@@ -197,7 +183,7 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 // ------------------------------------------------------------
-// WebSocket (Twilio Media Streams)
+// WebSocket server (Twilio Media)
 // ------------------------------------------------------------
 
 const wss = new WebSocketServer({ server: httpServer });
@@ -207,7 +193,7 @@ httpServer.listen(PORT, () => {
 });
 
 // ------------------------------------------------------------
-// MAIN CALL HANDLER — Realtime NLU → TTS → Twilio
+// HANDLE CALL — Realtime NLU + TTS
 // ------------------------------------------------------------
 
 function handleCall(twilioWs, clientId) {
@@ -217,6 +203,7 @@ function handleCall(twilioWs, clientId) {
   let openaiReady = false;
   let partial = "";
 
+  // Connect to OpenAI realtime
   const openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
     {
@@ -227,19 +214,19 @@ function handleCall(twilioWs, clientId) {
     }
   );
 
-  // ----------------------
-  // OpenAI connected
-  // ----------------------
+  // --------------------------
+  // OpenAI READY
+  // --------------------------
 
   openaiWs.on("open", () => {
-    console.log("✅ OpenAI realtime connected");
+    console.log("✅ OpenAI connected");
     openaiReady = true;
 
-    // IMPORTANT FIX: ONLY TEXT OUTPUT
+    // IMPORTANT: TEXT-ONLY OUTPUT
     openaiWs.send(JSON.stringify({
       type: "session.update",
       session: {
-        modalities: ["text"],     // ← FIX
+        modalities: ["text"],
         input_audio_format: "g711_ulaw",
         input_audio_transcription: { model: "whisper-1" },
         instructions: INSTRUCTIONS,
@@ -254,17 +241,17 @@ function handleCall(twilioWs, clientId) {
     }));
   });
 
-  // ----------------------
-  // Twilio → audio → OpenAI
-  // ----------------------
+  // --------------------------
+  // Twilio → OpenAI (audio)
+  // --------------------------
 
-  twilioWs.on("message", (msgStr) => {
+  twilioWs.on("message", (m) => {
     let msg;
-    try { msg = JSON.parse(msgStr); } catch { return; }
+    try { msg = JSON.parse(m); } catch { return; }
 
     if (msg.event === "start") {
       streamSid = msg.start.streamSid;
-      console.log("📡 STREAM SID:", streamSid);
+      console.log("📡 streamSid:", streamSid);
     }
 
     if (msg.event === "media" && openaiReady) {
@@ -280,26 +267,25 @@ function handleCall(twilioWs, clientId) {
     }
   });
 
-  // ----------------------
-  // OpenAI → TEXT → TTS → μ-law → Twilio
-  // ----------------------
+  // --------------------------
+  // OpenAI TEXT → TTS → Twilio
+  // --------------------------
 
   openaiWs.on("message", async (raw) => {
     const event = JSON.parse(raw);
-    console.log("🛰", event.type);
 
-    // TEXT-STREAMING
-    if (event.type === "response.output_text.delta") {
-      console.log("🔹 TEXT-DELTA:", event.delta);
+    // TEXT streaming
+    if (event.type === "response.text.delta") {
       partial += event.delta || "";
     }
 
-    if (event.type === "response.output_text.done") {
+    if (event.type === "response.text.done") {
       const text = partial.trim();
-      console.log("🔸 TEXT-DONE:", text);
       partial = "";
 
       if (!text) return;
+
+      console.log("🔸 FINAL TEXT:", text);
 
       try {
         const mp3 = await generateTTS(text);
@@ -307,23 +293,19 @@ function handleCall(twilioWs, clientId) {
 
         if (twilioWs.readyState === WebSocket.OPEN && streamSid) {
           sendMulawToTwilio(twilioWs, streamSid, mulaw);
-        } else {
-          console.log("⚠️ Twilio closed before send");
         }
       } catch (err) {
-        console.error("❌ TTS/DSP:", err.message);
+        console.error("❌ Audio send error:", err.message);
       }
     }
   });
 
-  // cleanup
+  // Cleanup
   twilioWs.on("close", () => {
-    console.log("📴 Twilio disconnected");
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
 
   openaiWs.on("close", () => {
-    console.log("📴 OpenAI closed");
     if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
   });
 }
@@ -345,19 +327,18 @@ async function pollTrello() {
   if (!TRELLO_KEY || !TRELLO_TOKEN || !TRELLO_LIST_ID) return;
 
   try {
-    const url =
-      `https://api.trello.com/1/lists/${TRELLO_LIST_ID}/cards?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
-
-    const res = await fetch(url);
+    const res = await fetch(
+      `https://api.trello.com/1/lists/${TRELLO_LIST_ID}/cards?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`
+    );
     if (!res.ok) return;
 
     const cards = await res.json();
 
-    for (const card of cards) {
-      const hasLabel = (card.labels || []).some(l => l.name === "GEBELD");
-      if (hasLabel) continue;
+    for (const c of cards) {
+      const has = (c.labels || []).some(l => l.name === "GEBELD");
+      if (has) continue;
 
-      const m = (card.desc || "").match(/(\+?[0-9][0-9()\-\s]{7,20})/);
+      const m = (c.desc || "").match(/(\+?[0-9][0-9()\-\s]{7,20})/);
       if (!m) continue;
 
       const phone = normalizePhone(m[0]);
@@ -365,24 +346,21 @@ async function pollTrello() {
 
       console.log("📞 Trello outbound:", phone);
 
-      try {
-        await startOutboundCall(phone);
+      await startOutboundCall(phone);
 
-        await fetch(
-          `https://api.trello.com/1/cards/${card.id}/labels?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name: "GEBELD", color: "green" })
-          }
-        );
-      } catch (err) {
-        console.error("❌ Trello/call:", err.message);
-      }
+      await fetch(
+        `https://api.trello.com/1/cards/${c.id}/labels?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: "GEBELD", color: "green" })
+        }
+      );
     }
-  } catch (err) {
-    console.error("❌ Trello poll:", err.message);
+  } catch (e) {
+    console.error("❌ Trello poll err:", e.message);
   }
 }
 
 setInterval(pollTrello, 15000);
+
