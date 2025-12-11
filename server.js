@@ -331,7 +331,7 @@ async function pollTrelloLeads() {
 
       if (!labelRes.ok) {
         const txt = await labelRes.text();
-        console.error(`❌ Failed to set GEBELD label on ${card.id}:`, txt);
+        console.error(`❌ Failed to set GEBELD label on card ${card.id}:`, txt);
       } else {
         console.log(`✅ Label GEBELD set on card ${card.id}`);
       }
@@ -645,9 +645,8 @@ function handleTwilioConnection(twilioWs, clientId) {
       type: 'session.update',
       session: {
         instructions: INSTRUCTIONS,
-        // Belangrijk: we willen alleen TEXT output, geen audio van OpenAI
-        modalities: ['text'],
-        output_modalities: ['text'],
+        // Audio in, tekst + evt audio uit (wij gebruiken alleen tekst-events)
+        modalities: ['audio', 'text'],
         input_audio_format: 'g711_ulaw',
         input_audio_transcription: {
           model: 'whisper-1'
@@ -732,9 +731,6 @@ function handleTwilioConnection(twilioWs, clientId) {
       );
       return;
     }
-
-    // Debug eventueel:
-    // console.log(`[${new Date().toISOString()}] OpenAI event: ${event.type}`);
 
     // VAD events
     if (event.type === 'input_audio_buffer.speech_started') {
@@ -969,4 +965,3 @@ process.on('unhandledRejection', (reason, promise) => {
     reason
   );
 });
-
