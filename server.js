@@ -1,9 +1,10 @@
-console.log('🚀 SERVER BOOTED – FULL BUILD');
-
 import WebSocket, { WebSocketServer } from 'ws';
 import dotenv from 'dotenv';
 import http from 'http';
 import twilio from 'twilio';
+import { execFile } from 'child_process';
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
 
@@ -15,34 +16,9 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 // Supported Realtime API voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
 const VOICE = process.env.VOICE || 'alloy';
 const SPEED = parseFloat(process.env.SPEED || '1.0'); // 0.25 to 4.0
-
 const INSTRUCTIONS =
   process.env.INSTRUCTIONS ||
-  [
-    'You are Tessa, a professional outbound phone agent calling business leads.',
-    'Your main goal is to quickly understand the situation and, where relevant, schedule a concrete appointment or callback for our sales team.',
-    '',
-    'Language:',
-    '- You speak Dutch and English fluently.',
-    '- Automatically detect whether the other person speaks Dutch or English and reply in that language.',
-    '',
-    'Style:',
-    '- Be short, clear and businesslike, but still friendly.',
-    '- Prefer 1–2 short sentences per turn, suitable for a normal telephone line.',
-    '- Avoid long stories, jargon and small talk unless the other person explicitly asks for it.',
-    '',
-    'Call structure (outbound sales/appointment):',
-    '1) Briefly introduce yourself and the company.',
-    '2) Check if this is a good moment to talk.',
-    '3) Ask a few focused qualification questions.',
-    '4) Propose a specific appointment time or clear next step (e.g. a callback).',
-    '5) Confirm the key details concisely.',
-    '',
-    'When the conversation is clearly finished and no further questions are asked, close the call with a short farewell and do NOT start a new topic.',
-    'Use one of these clear farewells:',
-    '- In Dutch: "Dank u wel, fijne dag, tot ziens."',
-    '- In English: "Thank you, have a nice day, goodbye."'
-  ].join(' ');
+  'You are Tessa, a helpful and friendly multilingual voice assistant. You can speak both English and Dutch fluently. Automatically detect the language the caller is using and respond in the same language. Speak naturally and conversationally. Help the caller with their questions in a professional and courteous manner. Als de beller Nederlands spreekt, antwoord dan in het Nederlands. If the caller speaks English, respond in English.';
 
 if (!OPENAI_API_KEY) {
   console.error('Error: OPENAI_API_KEY is not set in environment variables');
@@ -63,6 +39,116 @@ if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
   console.warn(
     '⚠️  TWILIO_ACCOUNT_SID of TWILIO_AUTH_TOKEN ontbreekt. Outbound calls zullen niet werken tot je deze env vars hebt gezet.'
   );
+}
+
+// ---------- ElevenLabs config (optioneel, laten staan) ----------
+
+const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
+const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_multilingual_v2';
+
+if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
+  console.warn('⚠️ ElevenLabs TTS disabled: missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID');
+} else {
+  console.log('✅ ElevenLabs ENV loaded');
+}
+
+/**
+ * Genereert TTS via ElevenLabs en geeft een Buffer met audio (mp3) terug.
+ */
+async function synthesizeWithElevenLabs(text) {
+  if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
+    throw new Error('ELEVENLABS_NOT_CONFIGURED');
+  }
+
+  const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`, {
+    method: 'POST',
+    headers: {
+      'xi-api-key': ELEVEN_API_KEY,
+      'Content-Type': 'application/json',
+      Accept: 'audio/mpeg'
+    },
+    body: JSON.stringify({
+      model_id: ELEVEN_MODEL,
+      text,
+      voice_settings: {
+        stability: 0.5,
+        similarity_boost: 0.8
+      }
+    })
+  });
+
+  if (!resp.ok) {
+    const errTxt = await resp.text().catch(() => '');
+    throw new Error(`ELEVENLABS_TTS_FAILED ${resp.status}: ${errTxt}`);
+  }
+
+  const arrayBuf = await resp.arrayBuffer();
+  return Buffer.from(arrayBuf);
+}
+
+// ---------- OpenAI TTS + DSP voor telefoon ----------
+
+/**
+ * Genereert TTS via OpenAI (alloy) als raw audio (meestal mp3).
+ */
+async function generateOpenAITTS(text) {
+  const resp = await fetch('https://api.openai.com/v1/audio/speech', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini-tts',
+      voice: 'alloy',
+      input: text
+    })
+  });
+
+  if (!resp.ok) {
+    const err = await resp.text().catch(() => '');
+    throw new Error(`OPENAI_TTS_FAILED: ${err}`);
+  }
+
+  return Buffer.from(await resp.arrayBuffer());
+}
+
+/**
+ * Past telefoon-DSP toe en zet om naar 8 kHz μ-law (G.711) wav.
+ * Resultaat klinkt veel beter over PSTN.
+ */
+function applyPhoneDSP(inputBuf, outPath) {
+  return new Promise((resolve, reject) => {
+    const tempIn = path.join('/tmp', `tts_in_${Date.now()}.mp3`);
+    fs.writeFileSync(tempIn, inputBuf);
+
+    const args = [
+      '-y',
+      '-i',
+      tempIn,
+      '-af',
+      'highpass=f=300, lowpass=f=3400, equalizer=f=2700:t=q:w=2:g=6, compand=attacks=0:decays=0:points=-80/-80|-12/-3|0/-3, dynaudnorm',
+      '-ar',
+      '8000',
+      '-ac',
+      '1',
+      '-codec:a',
+      'mulaw',
+      outPath
+    ];
+
+    execFile('ffmpeg', args, err => {
+      try {
+        fs.unlinkSync(tempIn);
+      } catch (_) {}
+      if (err) {
+        console.error('❌ ffmpeg error in applyPhoneDSP:', err.message);
+        return reject(err);
+      }
+      resolve(outPath);
+    });
+  });
 }
 
 // ---------- Trello config ----------
@@ -87,13 +173,6 @@ const serverStats = {
 };
 
 // ---------- Telefoonnummer normalisatie (NL + varianten) ----------
-// Ondersteunt o.a.:
-// 06-42125400
-// 06 42125400
-// 31642125400
-// 632125400   (6 + 8 cijfers)
-// +31(0)642125400
-// +31642125400 (blijft zo)
 
 function normalizePhone(raw) {
   if (!raw) return null;
@@ -220,7 +299,6 @@ async function pollTrelloLeads() {
       const desc = card.desc || '';
 
       // Pak telefoonnummer inclusief spaties, streepjes, haakjes
-      // Voorbeeld matcht: 06-42125400, 06 42125400, +31(0)642125400, etc.
       const match = desc.match(/(\+?[0-9][0-9()\-\s]{7,20})/);
 
       if (!match) {
@@ -262,9 +340,9 @@ async function pollTrelloLeads() {
 // elke 15 seconden pollen
 setInterval(pollTrelloLeads, 15000);
 
-// ---------- HTTP server (health, TwiML, call-test) ----------
+// ---------- HTTP server (health, TwiML, tests, TTS-demo) ----------
 
-const httpServer = http.createServer((req, res) => {
+const httpServer = http.createServer(async (req, res) => {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -343,6 +421,158 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // ElevenLabs test endpoint → /test-eleven?text=...
+  if (req.url.startsWith('/test-eleven') && req.method === 'GET') {
+    const urlObj = new URL(req.url, `http://${req.headers.host}`);
+    const text =
+      urlObj.searchParams.get('text') ||
+      'Hallo, ik ben Tessa, de AI-salesmachine. Dit is een test van ElevenLabs.';
+
+    console.log(`🔊 /test-eleven triggered with text: "${text}"`);
+
+    try {
+      const audioBuf = await synthesizeWithElevenLabs(text);
+      res.writeHead(200, { 'Content-Type': 'audio/mpeg' });
+      res.end(audioBuf);
+    } catch (e) {
+      console.error('❌ ElevenLabs test error:', e.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+
+    return;
+  }
+
+  // OpenAI TTS + DSP preview → /tts-preview?text=...
+  if (req.url.startsWith('/tts-preview') && req.method === 'GET') {
+    const urlObj = new URL(req.url, `http://${req.headers.host}`);
+    const text = urlObj.searchParams.get('text') || 'Dit is een test van Tessa.';
+
+    console.log(`🔊 /tts-preview triggered with text: "${text}"`);
+
+    try {
+      const raw = await generateOpenAITTS(text);
+      const outFile = path.join('/tmp', `tts_phone_${Date.now()}.wav`);
+      await applyPhoneDSP(raw, outFile);
+
+      const audio = fs.readFileSync(outFile);
+      res.writeHead(200, { 'Content-Type': 'audio/wav' });
+      res.end(audio);
+
+      try {
+        fs.unlinkSync(outFile);
+      } catch (_) {}
+    } catch (e) {
+      console.error('❌ TTS preview error:', e.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // Static serve van tijdelijke audio-bestanden → /audio-temp/<file>
+  if (req.url.startsWith('/audio-temp/') && req.method === 'GET') {
+    const file = req.url.replace('/audio-temp/', '');
+    const full = path.join('/tmp', file);
+    if (!fs.existsSync(full)) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not found');
+      return;
+    }
+    const data = fs.readFileSync(full);
+    res.writeHead(200, { 'Content-Type': 'audio/wav' });
+    res.end(data);
+    return;
+  }
+
+  // TwiML voor het afspelen van een gegenereerd TTS-bestand
+  if (req.url.startsWith('/twiml-play') && req.method === 'POST') {
+    if (!PUBLIC_BASE_URL) {
+      res.writeHead(500, { 'Content-Type': 'text/xml' });
+      res.end('<Response><Say>Server misconfigured</Say></Response>');
+      return;
+    }
+
+    const urlObj = new URL(req.url, `http://${req.headers.host}`);
+    const file = urlObj.searchParams.get('file');
+    if (!file) {
+      res.writeHead(400, { 'Content-Type': 'text/xml' });
+      res.end('<Response><Say>Missing audio file</Say></Response>');
+      return;
+    }
+
+    const audioUrl = `${PUBLIC_BASE_URL}/audio-temp/${file}`;
+    console.log(`🎵 /twiml-play serving audio: ${audioUrl}`);
+
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${audioUrl}</Play>
+</Response>`;
+
+    res.writeHead(200, { 'Content-Type': 'text/xml' });
+    res.end(twiml);
+    return;
+  }
+
+  // OpenAI TTS + DSP bel-demo → /call-tts-test?phone=...&text=...
+  if (req.url.startsWith('/call-tts-test') && req.method === 'GET') {
+    const urlObj = new URL(req.url, `http://${req.headers.host}`);
+    const phone = urlObj.searchParams.get('phone');
+    const text =
+      urlObj.searchParams.get('text') || 'Hallo, dit is een test met Tessa over de telefoon.';
+
+    if (!phone) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing phone parameter' }));
+      return;
+    }
+
+    if (!twilioClient || !TWILIO_FROM || !PUBLIC_BASE_URL) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          error: 'Twilio or PUBLIC_BASE_URL not configured for call-tts-test'
+        })
+      );
+      return;
+    }
+
+    console.log(`📞 /call-tts-test triggered for: ${phone}, text="${text}"`);
+
+    try {
+      const normalized = normalizePhone(phone);
+      if (!normalized) {
+        throw new Error(`Cannot normalize phone number: ${phone}`);
+      }
+
+      const raw = await generateOpenAITTS(text);
+      const outFileBase = `tts_call_${Date.now()}.wav`;
+      const outFile = path.join('/tmp', outFileBase);
+      await applyPhoneDSP(raw, outFile);
+
+      const twimlUrl = `${PUBLIC_BASE_URL}/twiml-play?file=${encodeURIComponent(outFileBase)}`;
+
+      const call = await twilioClient.calls.create({
+        to: normalized,
+        from: TWILIO_FROM,
+        url: twimlUrl
+      });
+
+      console.log(
+        `[${new Date().toISOString()}] TTS demo call created: CallSid=${call.sid}, To=${normalized}, TwiML=${twimlUrl}`
+      );
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'calling', phone: normalized }));
+    } catch (e) {
+      console.error('❌ call-tts-test error:', e.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+
+    return;
+  }
+
   // Fallback 404
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not Found' }));
@@ -359,6 +589,7 @@ httpServer.listen(PORT, () => {
 });
 
 // Twilio connection handler
+
 function handleTwilioConnection(twilioWs, clientId) {
   console.log(`[${new Date().toISOString()}] Setting up Twilio media stream for: ${clientId}`);
 
@@ -381,61 +612,6 @@ function handleTwilioConnection(twilioWs, clientId) {
   );
 
   let isOpenAIConnected = false;
-
-  // ---------- Hang-up state (assistant goodbye + 3s silence) ----------
-  const SILENCE_AFTER_GOODBYE_MS = 3000; // 3 seconden stilte na afscheid
-  let hangupTimer = null;
-
-  // Deze phrases definiëren "gedag zeggen". We checken of ze aan het einde van de utterance staan.
-  const farewellPhrases = [
-    'tot ziens',
-    'fijne dag, tot ziens',
-    'fijne dag verder, tot ziens',
-    'dank u wel, fijne dag, tot ziens',
-    'dank je wel, fijne dag, tot ziens',
-    'goodbye',
-    'have a nice day, goodbye',
-    'thank you, have a nice day, goodbye'
-  ];
-
-  function clearHangupTimer() {
-    if (hangupTimer) {
-      clearTimeout(hangupTimer);
-      hangupTimer = null;
-      console.log(
-        `[${new Date().toISOString()}] ⏱️  Cleared pending hang-up timer (conversation continues)`
-      );
-    }
-  }
-
-  function endCall(reason) {
-    console.log(
-      `[${new Date().toISOString()}] 📴 Ending call ${callSid || ''} - reason: ${reason}`
-    );
-    clearHangupTimer();
-
-    if (twilioWs.readyState === WebSocket.OPEN) {
-      twilioWs.close();
-    }
-
-    if (openaiWs.readyState === WebSocket.OPEN) {
-      openaiWs.close();
-    }
-  }
-
-  function scheduleHangupAfterGoodbye() {
-    clearHangupTimer();
-    hangupTimer = setTimeout(() => {
-      console.log(
-        `[${new Date().toISOString()}] ⏱️  Silence after assistant farewell (${SILENCE_AFTER_GOODBYE_MS}ms) - ending call`
-      );
-      endCall('assistant_goodbye_and_silence');
-    }, SILENCE_AFTER_GOODBYE_MS);
-
-    console.log(
-      `[${new Date().toISOString()}] ⏱️  Scheduled hang-up in ${SILENCE_AFTER_GOODBYE_MS}ms after assistant farewell`
-    );
-  }
 
   openaiWs.on('open', () => {
     console.log(
@@ -472,7 +648,25 @@ function handleTwilioConnection(twilioWs, clientId) {
       `[${new Date().toISOString()}] Session config sent:`,
       JSON.stringify(sessionConfig)
     );
-    console.log(`[${new Date().toISOString()}] Waiting for user to speak first - no automatic greeting`);
+
+    // Eerste begroeting
+    setTimeout(() => {
+      if (openaiWs.readyState === WebSocket.OPEN) {
+        const greetingMessage = {
+          type: 'response.create',
+          response: {
+            modalities: ['audio', 'text'],
+            instructions:
+              'Groet de beller warm in het Nederlands en vraag hoe je hen vandaag kunt helpen.',
+            voice: VOICE
+          }
+        };
+        openaiWs.send(JSON.stringify(greetingMessage));
+        console.log(
+          `[${new Date().toISOString()}] Initial greeting triggered for: ${clientId}`
+        );
+      }
+    }, 250);
   });
 
   // Twilio → OpenAI audio
@@ -529,9 +723,6 @@ function handleTwilioConnection(twilioWs, clientId) {
       if (event.type === 'input_audio_buffer.speech_started') {
         console.log(`[${new Date().toISOString()}] User interruption detected`);
 
-        // Zodra de beller weer praat, geen automatisch ophangen meer op basis van het vorige afscheid
-        clearHangupTimer();
-
         if (isResponseActive && openaiWs.readyState === WebSocket.OPEN) {
           openaiWs.send(JSON.stringify({ type: 'response.cancel' }));
           console.log(`[${new Date().toISOString()}] Sent response.cancel`);
@@ -548,9 +739,6 @@ function handleTwilioConnection(twilioWs, clientId) {
       }
 
       if (event.type === 'response.output_item.added') {
-        // Nieuwe utterance = gesprek gaat weer verder → hang-up timer van vorige afscheid annuleren
-        clearHangupTimer();
-
         lastAssistantItem = event.item;
         responseStartTimestamp = Date.now();
         audioChunkCount = 0;
@@ -558,14 +746,6 @@ function handleTwilioConnection(twilioWs, clientId) {
         console.log(
           `[${new Date().toISOString()}] 🎤 New response started - waiting for audio chunks...`
         );
-      }
-
-      // Collect transcript text for hangup detection
-      if (event.type === 'response.audio_transcript.delta' && event.delta) {
-        if (!lastAssistantItem.transcript) {
-          lastAssistantItem.transcript = '';
-        }
-        lastAssistantItem.transcript += event.delta.toLowerCase();
       }
 
       if (event.type === 'response.cancelled') {
@@ -637,39 +817,6 @@ function handleTwilioConnection(twilioWs, clientId) {
             `[${new Date().toISOString()}] ⚠️ WARNING: Response completed but NO audio chunks were received from OpenAI!`
           );
         }
-
-        if (lastAssistantItem && lastAssistantItem.transcript) {
-          const transcriptText = lastAssistantItem.transcript.trim();
-          const lower = transcriptText.toLowerCase();
-
-          console.log(
-            `[${new Date().toISOString()}] 📝 Full assistant transcript: "${transcriptText}"`
-          );
-
-          // Alleen als een afscheid ZICHTBAAR aan het EINDE staat, starten we de 3s stilte-timer
-          const hasFarewellAtEnd = farewellPhrases.some(phrase => {
-            const lp = phrase.toLowerCase();
-            const idx = lower.lastIndexOf(lp);
-            if (idx === -1) return false;
-
-            const after = lower.slice(idx + lp.length).trim();
-            // Alleen niets of simpele interpunctie na de afscheidszin toestaan
-            return after === '' || /^[.!?"']+$/.test(after);
-          });
-
-          if (hasFarewellAtEnd) {
-            console.log(
-              `[${new Date().toISOString()}] 📞 Assistant farewell detected at end of utterance - waiting for ${SILENCE_AFTER_GOODBYE_MS}ms of silence before hanging up`
-            );
-            scheduleHangupAfterGoodbye();
-          } else {
-            // Geen duidelijke afsluiting → eventuele oude timer weghalen
-            clearHangupTimer();
-          }
-        } else {
-          // Geen transcript = geen basis om op te hangen
-          clearHangupTimer();
-        }
       }
 
       if (event.type === 'error') {
@@ -693,8 +840,6 @@ function handleTwilioConnection(twilioWs, clientId) {
       `[${new Date().toISOString()}] Active connections: ${serverStats.activeConnections}`
     );
 
-    clearHangupTimer();
-
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.close();
     }
@@ -707,8 +852,6 @@ function handleTwilioConnection(twilioWs, clientId) {
       error.message
     );
 
-    clearHangupTimer();
-
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.close();
     }
@@ -719,8 +862,6 @@ function handleTwilioConnection(twilioWs, clientId) {
       `[${new Date().toISOString()}] OpenAI closed for Twilio call ${callSid} (code: ${code})`
     );
     isOpenAIConnected = false;
-
-    clearHangupTimer();
 
     if (twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.close();
@@ -734,8 +875,6 @@ function handleTwilioConnection(twilioWs, clientId) {
       error.message
     );
     isOpenAIConnected = false;
-
-    clearHangupTimer();
 
     if (twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.close();
