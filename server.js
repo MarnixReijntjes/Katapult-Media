@@ -133,19 +133,19 @@ function applyPhoneDSP(inputBuf, outPath) {
       '8000',
       '-ac',
       '1',
-      '-codec:a',
-      'mulaw',
+      '-c:a',
+      'pcm_mulaw',
       outPath
     ];
 
     execFile('ffmpeg', args, err => {
-      try {
-        fs.unlinkSync(tempIn);
-      } catch (_) {}
+      try { fs.unlinkSync(tempIn); } catch (_) {}
+
       if (err) {
         console.error('❌ ffmpeg error in applyPhoneDSP:', err.message);
         return reject(err);
       }
+
       resolve(outPath);
     });
   });
@@ -953,3 +953,4 @@ process.on('unhandledRejection', (reason, promise) => {
     reason
   );
 });
+
