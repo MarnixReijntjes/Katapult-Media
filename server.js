@@ -603,7 +603,7 @@ function handleTwilioConnection(twilioWs, clientId) {
   '-i', 'pipe:0',
   '-af',
   // pitch +10% (asetrate+atempo) + telefoon-EQ
-  'asetrate=17600,atempo=0.9091,highpass=f=300,lowpass=f=3400,equalizer=f=3000:t=q:w=2:g=4,compand=attacks=0:decays=0:points=-80/-80|-20/-6|0/-3,dynaudnorm',
+  'asetrate=18800,atempo=0.851,highpass=f=300,lowpass=f=3400,equalizer=f=3100:t=q:w=2:g=5,compand=attacks=0:decays=0:points=-80/-80|-18/-6|0/-3,dynaudnorm',
   '-ar', '8000',
   '-ac', '1',
   '-c:a', 'pcm_mulaw',
@@ -1009,4 +1009,5 @@ process.on('unhandledRejection', (reason, promise) => {
     reason
   );
 });
+
 
