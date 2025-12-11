@@ -2,7 +2,7 @@ import WebSocket, { WebSocketServer } from 'ws';
 import dotenv from 'dotenv';
 import http from 'http';
 import twilio from 'twilio';
-import { execFile, spawn } from 'child_process';
+import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -15,7 +15,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 // Supported Realtime API voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
 const VOICE = process.env.VOICE || 'alloy';
-const SPEED = parseFloat(process.env.SPEED || '1.0'); // 0.25 to 4.0
+const SPEED = parseFloat(process.env.SPEED || '1.0'); // wordt niet meer gebruikt voor OpenAI TTS
 const INSTRUCTIONS =
   process.env.INSTRUCTIONS ||
   'Je heet Tessa. Je belt Nederlandstalige leads om kort een afspraak in te plannen. Spreek kort, duidelijk en informeel beleefd. Stel snel vast of iemand interesse heeft; kom vlot tot een afspraak of een duidelijke “nee”. Vraag nooit om gevoelige gegevens. Sluit het gesprek altijd af met een duidelijke afscheidstekst waarin letterlijk het woord “tot ziens” voorkomt.';
@@ -645,7 +645,7 @@ function handleTwilioConnection(twilioWs, clientId) {
       type: 'session.update',
       session: {
         instructions: INSTRUCTIONS,
-        modalities: ['input_audio', 'output_text'],
+        modalities: ['audio', 'text'], // FIX: geen "input_audio" meer
         input_audio_format: 'g711_ulaw',
         input_audio_transcription: {
           model: 'whisper-1'
@@ -658,8 +658,7 @@ function handleTwilioConnection(twilioWs, clientId) {
           create_response: true
         },
         temperature: 0.6,
-        max_response_output_tokens: 512,
-        speed: SPEED
+        max_response_output_tokens: 512
       }
     };
 
