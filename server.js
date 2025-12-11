@@ -279,30 +279,44 @@ function handleTwilioCall(twilioWs, clientId) {
   let openaiReady = false;
 
   openaiWs.on("open", () => {
-    openaiReady = true;
-    console.log("✅ OpenAI realtime connected");
+  openaiReady = true;
+  console.log("✅ OpenAI realtime connected");
 
-    const sessionConfig = {
-      type: "session.update",
-      session: {
-        modalities: ["audio", "text"],
-        input_audio_format: "g711_ulaw",
-        input_audio_transcription: { model: "whisper-1" },
-        instructions: INSTRUCTIONS,
-        // IMPORTANT: No audio output in realtime — TEXT ONLY
-        output_audio_format: null,
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.5,
-          prefix_padding_ms: 200,
-          silence_duration_ms: 400,
-          create_response: true
-        }
+  const sessionConfig = {
+    type: "session.update",
+    session: {
+      modalities: ["audio", "text"],
+      input_audio_format: "g711_ulaw",
+      input_audio_transcription: { model: "whisper-1" },
+      instructions: INSTRUCTIONS,
+      output_audio_format: null,
+      turn_detection: {
+        type: "server_vad",
+        threshold: 0.5,
+        prefix_padding_ms: 200,
+        silence_duration_ms: 400,
+        create_response: true
       }
-    };
+    }
+  };
 
-    openaiWs.send(JSON.stringify(sessionConfig));
-  });
+  openaiWs.send(JSON.stringify(sessionConfig));
+
+  // eerste begroeting
+  setTimeout(() => {
+    if (openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.send(JSON.stringify({
+        type: "response.create",
+        response: {
+          instructions:
+            "Groet de beller in het Nederlands als een vriendelijke vrouwelijke medewerker en leg kort uit dat je een virtuele assistent bent. Vraag hoe je kunt helpen.",
+          modalities: ["text"]
+        }
+      }));
+    }
+  }, 200);
+});
+
 
   // ----------------------------------------------------------
   // 2. Twilio → audio → OpenAI (speech to text)
@@ -483,4 +497,5 @@ process.on("SIGTERM", shutdown);
 // ------------------------------------------------------------
 // END OF FILE
 // ============================================================
+
 
