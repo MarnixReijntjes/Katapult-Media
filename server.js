@@ -669,7 +669,20 @@ function handleTwilioConnection(twilioWs, clientId) {
       JSON.stringify(sessionConfig)
     );
 
-    // Geen auto-greeting; Tessa praat pas na de beller.
+    // Directe openingszin laten genereren
+    const greetingMessage = {
+      type: 'response.create',
+      response: {
+        modalities: ['text'],
+        instructions:
+          'Gebruik je vaste openingszin aan de telefoon in het Nederlands: "Hoi, met Tessa. Ik bel namens Move2Go Solutions. Wij zijn een ontruimingsbedrijf gespecialiseerd in het leegmaken en opruimen van woningen. Ik kreeg uw aanvraag binnen en ik was benieuwd of u heel kort wat meer informatie over de werkzaamheden kunt geven." Houd het kort en natuurlijk.'
+      }
+    };
+
+    openaiWs.send(JSON.stringify(greetingMessage));
+    console.log(
+      `[${new Date().toISOString()}] Initial greeting triggered for: ${clientId}`
+    );
   });
 
   // Twilio → OpenAI audio
@@ -845,123 +858,4 @@ function handleTwilioConnection(twilioWs, clientId) {
     serverStats.activeConnections--;
     console.log(`[${new Date().toISOString()}] Twilio disconnected: ${clientId}`);
     console.log(
-      `[${new Date().toISOString()}] Active connections: ${serverStats.activeConnections}`
-    );
-
-    if (openaiWs.readyState === WebSocket.OPEN) {
-      openaiWs.close();
-    }
-    if (hangupInterval) clearInterval(hangupInterval);
-  });
-
-  twilioWs.on('error', error => {
-    serverStats.totalErrors++;
-    console.error(
-      `[${new Date().toISOString()}] Twilio WebSocket error (${clientId}):`,
-      error.message
-    );
-
-    if (openaiWs.readyState === WebSocket.OPEN) {
-      openaiWs.close();
-    }
-    if (hangupInterval) clearInterval(hangupInterval);
-  });
-
-  openaiWs.on('close', code => {
-    console.log(
-      `[${new Date().toISOString()}] OpenAI closed for Twilio call ${callSid} (code: ${code})`
-    );
-    isOpenAIConnected = false;
-
-    if (twilioWs.readyState === WebSocket.OPEN) {
-      twilioWs.close();
-    }
-    if (hangupInterval) clearInterval(hangupInterval);
-  });
-
-  openaiWs.on('error', error => {
-    serverStats.totalErrors++;
-    console.error(
-      `[${new Date().toISOString()}] OpenAI error for Twilio call (${clientId}):`,
-      error.message
-    );
-    isOpenAIConnected = false;
-
-    if (twilioWs.readyState === WebSocket.OPEN) {
-      twilioWs.close();
-    }
-    if (hangupInterval) clearInterval(hangupInterval);
-  });
-}
-
-// ---------- WebSocket events ----------
-
-wss.on('connection', (clientWs, request) => {
-  const clientId = `${request.socket.remoteAddress}:${request.socket.remotePort}`;
-
-  serverStats.totalConnections++;
-  serverStats.activeConnections++;
-
-  console.log(`[${new Date().toISOString()}] New Twilio connection: ${clientId}`);
-  console.log(
-    `[${new Date().toISOString()}] Active connections: ${serverStats.activeConnections}`
-  );
-
-  handleTwilioConnection(clientWs, clientId);
-});
-
-wss.on('error', error => {
-  serverStats.totalErrors++;
-  console.error(
-    `[${new Date().toISOString()}] WebSocket server error:`,
-    error.message
-  );
-});
-
-httpServer.on('error', error => {
-  console.error(`[${new Date().toISOString()}] HTTP server error:`, error.message);
-  process.exit(1);
-});
-
-// ---------- Graceful shutdown ----------
-
-const shutdown = () => {
-  console.log(`\n[${new Date().toISOString()}] Shutting down server...`);
-  console.log(
-    `[${new Date().toISOString()}] Total connections served: ${serverStats.totalConnections}`
-  );
-  console.log(
-    `[${new Date().toISOString()}] Total errors: ${serverStats.totalErrors}`
-  );
-
-  wss.close(() => {
-    httpServer.close(() => {
-      console.log(`[${new Date().toISOString()}] Server closed gracefully`);
-      process.exit(0);
-    });
-  });
-
-  setTimeout(() => {
-    console.error(
-      `[${new Date().toISOString()}] Forced shutdown after timeout`
-    );
-    process.exit(1);
-  }, 10000);
-};
-
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
-
-process.on('uncaughtException', error => {
-  console.error(`[${new Date().toISOString()}] Uncaught exception:`, error);
-  process.exit(1);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error(
-    `[${new Date().toISOString()}] Unhandled rejection at:`,
-    promise,
-    'reason:',
-    reason
-  );
-});
+      `[${new Date().toISOString()}] Active connections: ${serverSt
