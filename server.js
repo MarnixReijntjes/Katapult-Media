@@ -15,7 +15,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 // Supported Realtime API voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
 const VOICE = process.env.VOICE || 'alloy';
-const SPEED = parseFloat(process.env.SPEED || '1.0'); // wordt niet meer gebruikt voor OpenAI TTS
+const SPEED = parseFloat(process.env.SPEED || '1.0'); // niet meer gebruikt voor OpenAI TTS
 const INSTRUCTIONS =
   process.env.INSTRUCTIONS ||
   'Je heet Tessa. Je belt Nederlandstalige leads om kort een afspraak in te plannen. Spreek kort, duidelijk en informeel beleefd. Stel snel vast of iemand interesse heeft; kom vlot tot een afspraak of een duidelijke “nee”. Vraag nooit om gevoelige gegevens. Sluit het gesprek altijd af met een duidelijke afscheidstekst waarin letterlijk het woord “tot ziens” voorkomt.';
@@ -645,7 +645,9 @@ function handleTwilioConnection(twilioWs, clientId) {
       type: 'session.update',
       session: {
         instructions: INSTRUCTIONS,
-        modalities: ['audio', 'text'], // FIX: geen "input_audio" meer
+        // Belangrijk: we willen alleen TEXT output, geen audio van OpenAI
+        modalities: ['text'],
+        output_modalities: ['text'],
         input_audio_format: 'g711_ulaw',
         input_audio_transcription: {
           model: 'whisper-1'
@@ -730,6 +732,9 @@ function handleTwilioConnection(twilioWs, clientId) {
       );
       return;
     }
+
+    // Debug eventueel:
+    // console.log(`[${new Date().toISOString()}] OpenAI event: ${event.type}`);
 
     // VAD events
     if (event.type === 'input_audio_buffer.speech_started') {
