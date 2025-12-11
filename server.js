@@ -13,7 +13,6 @@ dotenv.config();
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Supported Realtime API voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
 const VOICE = process.env.VOICE || 'alloy';
 const SPEED = parseFloat(process.env.SPEED || '1.0'); // niet meer gebruikt voor OpenAI TTS
 const INSTRUCTIONS =
@@ -154,7 +153,7 @@ function applyPhoneDSP(inputBuf, outPath) {
     execFile('ffmpeg', args, err => {
       try {
         fs.unlinkSync(tempIn);
-      } catch (_) {}
+      } catch {}
 
       if (err) {
         console.error('❌ ffmpeg error in applyPhoneDSP:', err.message);
@@ -464,7 +463,7 @@ const httpServer = http.createServer(async (req, res) => {
 
       try {
         fs.unlinkSync(outFile);
-      } catch (_) {}
+      } catch {}
     } catch (e) {
       console.error('❌ TTS preview error:', e.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -626,10 +625,10 @@ function handleTwilioConnection(twilioWs, clientId) {
         console.log(`[${new Date().toISOString()}] Hangup condition met, closing Twilio/OpenAI`);
         try {
           twilioWs.close();
-        } catch (_) {}
+        } catch {}
         try {
           openaiWs.close();
-        } catch (_) {}
+        } catch {}
         clearInterval(hangupInterval);
       }
     }, 500);
@@ -645,7 +644,6 @@ function handleTwilioConnection(twilioWs, clientId) {
       type: 'session.update',
       session: {
         instructions: INSTRUCTIONS,
-        // Audio in, tekst + evt audio uit (wij gebruiken alleen tekst-events)
         modalities: ['audio', 'text'],
         input_audio_format: 'g711_ulaw',
         input_audio_transcription: {
@@ -665,8 +663,7 @@ function handleTwilioConnection(twilioWs, clientId) {
 
     openaiWs.send(JSON.stringify(sessionConfig));
     console.log(
-      `[${new Date().toISOString()}] Session config sent:`,
-      JSON.stringify(sessionConfig)
+      `[${new Date().toISOString()}] Session config sent: ${JSON.stringify(sessionConfig)}`
     );
 
     // Directe openingszin laten genereren
@@ -726,8 +723,7 @@ function handleTwilioConnection(twilioWs, clientId) {
       }
     } catch (error) {
       console.error(
-        `[${new Date().toISOString()}] Error processing Twilio message:`,
-        error.message
+        `[${new Date().toISOString()}] Error processing Twilio message: ${error.message}`
       );
     }
   });
@@ -739,18 +735,15 @@ function handleTwilioConnection(twilioWs, clientId) {
       event = JSON.parse(data);
     } catch (error) {
       console.error(
-        `[${new Date().toISOString()}] Error parsing OpenAI message:`,
-        error.message
+        `[${new Date().toISOString()}] Error parsing OpenAI message: ${error.message}`
       );
       return;
     }
 
-    // VAD events
     if (event.type === 'input_audio_buffer.speech_started') {
       console.log(`[${new Date().toISOString()}] User speech started`);
       lastUserSpeechAt = Date.now();
 
-      // Barge-in: lopende TTS stoppen
       if (playingAudio) {
         stopCurrentTts = true;
         playingAudio = false;
@@ -771,11 +764,9 @@ function handleTwilioConnection(twilioWs, clientId) {
     if (event.type === 'input_audio_buffer.speech_stopped') {
       console.log(`[${new Date().toISOString()}] User speech stopped`);
       lastUserSpeechAt = Date.now();
-      // server_vad + create_response=true → model start zelf response
       return;
     }
 
-    // Tekst-output opbouwen
     if (event.type === 'response.output_text.delta') {
       currentAssistantText += event.delta;
       return;
@@ -837,8 +828,7 @@ function handleTwilioConnection(twilioWs, clientId) {
         playingAudio = false;
       } catch (e) {
         console.error(
-          `[${new Date().toISOString()}] TTS playback error:`,
-          e.message
+          `[${new Date().toISOString()}] TTS playback error: ${e.message}`
         );
         playingAudio = false;
       }
@@ -848,14 +838,140 @@ function handleTwilioConnection(twilioWs, clientId) {
 
     if (event.type === 'error') {
       console.error(
-        `[${new Date().toISOString()}] OpenAI error event:`,
-        JSON.stringify(event.error)
+        `[${new Date().toISOString()}] OpenAI error event: ${JSON.stringify(event.error)}`
       );
     }
   });
 
   twilioWs.on('close', () => {
     serverStats.activeConnections--;
-    console.log(`[${new Date().toISOString()}] Twilio disconnected: ${clientId}`);
     console.log(
-      `[${new Date().toISOString()}] Active connections: ${serverSt
+      `[${new Date().toISOString()}] Twilio disconnected: ${clientId}`
+    );
+    console.log(
+      `[${new Date().toISOString()}] Active connections: ${serverStats.activeConnections}`
+    );
+
+    if (openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.close();
+    }
+    if (hangupInterval) clearInterval(hangupInterval);
+  });
+
+  twilioWs.on('error', error => {
+    serverStats.totalErrors++;
+    console.error(
+      `[${new Date().toISOString()}] Twilio WebSocket error (${clientId}): ${error.message}`
+    );
+
+    if (openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.close();
+    }
+    if (hangupInterval) clearInterval(hangupInterval);
+  });
+
+  openaiWs.on('close', code => {
+    console.log(
+      `[${new Date().toISOString()}] OpenAI closed for Twilio call ${callSid} (code: ${code})`
+    );
+    isOpenAIConnected = false;
+
+    if (twilioWs.readyState === WebSocket.OPEN) {
+      twilioWs.close();
+    }
+    if (hangupInterval) clearInterval(hangupInterval);
+  });
+
+  openaiWs.on('error', error => {
+    serverStats.totalErrors++;
+    console.error(
+      `[${new Date().toISOString()}] OpenAI error for Twilio call (${clientId}): ${error.message}`
+    );
+    isOpenAIConnected = false;
+
+    if (twilioWs.readyState === WebSocket.OPEN) {
+      twilioWs.close();
+    }
+    if (hangupInterval) clearInterval(hangupInterval);
+  });
+}
+
+// ---------- WebSocket events ----------
+
+wss.on('connection', (clientWs, request) => {
+  const clientId = `${request.socket.remoteAddress}:${request.socket.remotePort}`;
+
+  serverStats.totalConnections++;
+  serverStats.activeConnections++;
+
+  console.log(
+    `[${new Date().toISOString()}] New Twilio connection: ${clientId}`
+  );
+  console.log(
+    `[${new Date().toISOString()}] Active connections: ${serverStats.activeConnections}`
+  );
+
+  handleTwilioConnection(clientWs, clientId);
+});
+
+wss.on('error', error => {
+  serverStats.totalErrors++;
+  console.error(
+    `[${new Date().toISOString()}] WebSocket server error: ${error.message}`
+  );
+});
+
+httpServer.on('error', error => {
+  console.error(
+    `[${new Date().toISOString()}] HTTP server error: ${error.message}`
+  );
+  process.exit(1);
+});
+
+// ---------- Graceful shutdown ----------
+
+const shutdown = () => {
+  console.log(`\n[${new Date().toISOString()}] Shutting down server...`);
+  console.log(
+    `[${new Date().toISOString()}] Total connections served: ${serverStats.totalConnections}`
+  );
+  console.log(
+    `[${new Date().toISOString()}] Total errors: ${serverStats.totalErrors}`
+  );
+
+  wss.close(() => {
+    httpServer.close(() => {
+      console.log(
+        `[${new Date().toISOString()}] Server closed gracefully`
+      );
+      process.exit(0);
+    });
+  });
+
+  setTimeout(() => {
+    console.error(
+      `[${new Date().toISOString()}] Forced shutdown after timeout`
+    );
+    process.exit(1);
+  }, 10000);
+};
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+process.on('uncaughtException', error => {
+  console.error(
+    `[${new Date().toISOString()}] Uncaught exception:`,
+    error
+  );
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error(
+    `[${new Date().toISOString()}] Unhandled rejection at:`,
+    promise,
+    'reason:',
+    reason
+  );
+});
