@@ -690,7 +690,6 @@ function handleTwilioConnection(twilioWs, clientId) {
         voice: VOICE,
         input_audio_format: 'g711_ulaw', // van Twilio binnenkomend
         output_audio_format: 'pcm16',     // high quality naar ons
-        output_audio_sample_rate: 16000,
         input_audio_transcription: {
           model: 'whisper-1'
         },
@@ -1009,5 +1008,6 @@ process.on('unhandledRejection', (reason, promise) => {
     reason
   );
 });
+
 
 
