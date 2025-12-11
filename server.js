@@ -302,21 +302,6 @@ function handleTwilioCall(twilioWs, clientId) {
 
   openaiWs.send(JSON.stringify(sessionConfig));
 
-  // eerste begroeting
-  setTimeout(() => {
-    if (openaiWs.readyState === WebSocket.OPEN) {
-      openaiWs.send(JSON.stringify({
-        type: "response.create",
-        response: {
-          instructions:
-            "Groet de beller in het Nederlands als een vriendelijke vrouwelijke medewerker en leg kort uit dat je een virtuele assistent bent. Vraag hoe je kunt helpen.",
-          modalities: ["text"]
-        }
-      }));
-    }
-  }, 200);
-});
-
 
   // ----------------------------------------------------------
   // 2. Twilio → audio → OpenAI (speech to text)
@@ -508,6 +493,7 @@ process.on("SIGTERM", shutdown);
 // ------------------------------------------------------------
 // END OF FILE
 // ============================================================
+
 
 
 
