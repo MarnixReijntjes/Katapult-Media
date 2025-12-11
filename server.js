@@ -2,9 +2,6 @@ import WebSocket, { WebSocketServer } from 'ws';
 import dotenv from 'dotenv';
 import http from 'http';
 import twilio from 'twilio';
-import { execFile, spawn } from 'child_process';
-import fs from 'fs';
-import path from 'path';
 
 dotenv.config();
 
@@ -41,118 +38,6 @@ if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
   );
 }
 
-// ---------- ElevenLabs config (optioneel, laten staan) ----------
-
-const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
-const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
-const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_multilingual_v2';
-
-if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
-  console.warn('⚠️ ElevenLabs TTS disabled: missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID');
-} else {
-  console.log('✅ ElevenLabs ENV loaded');
-}
-
-/**
- * Genereert TTS via ElevenLabs en geeft een Buffer met audio (mp3) terug.
- */
-async function synthesizeWithElevenLabs(text) {
-  if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
-    throw new Error('ELEVENLABS_NOT_CONFIGURED');
-  }
-
-  const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`, {
-    method: 'POST',
-    headers: {
-      'xi-api-key': ELEVEN_API_KEY,
-      'Content-Type': 'application/json',
-      Accept: 'audio/mpeg'
-    },
-    body: JSON.stringify({
-      model_id: ELEVEN_MODEL,
-      text,
-      voice_settings: {
-        stability: 0.5,
-        similarity_boost: 0.8
-      }
-    })
-  });
-
-  if (!resp.ok) {
-    const errTxt = await resp.text().catch(() => '');
-    throw new Error(`ELEVENLABS_TTS_FAILED ${resp.status}: ${errTxt}`);
-  }
-
-  const arrayBuf = await resp.arrayBuffer();
-  return Buffer.from(arrayBuf);
-}
-
-// ---------- OpenAI TTS + DSP voor telefoon (offline demo) ----------
-
-/**
- * Genereert TTS via OpenAI (alloy) als raw audio (mp3/wav).
- */
-async function generateOpenAITTS(text) {
-  const resp = await fetch('https://api.openai.com/v1/audio/speech', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini-tts',
-      voice: 'alloy',
-      input: text
-    })
-  });
-
-  if (!resp.ok) {
-    const err = await resp.text().catch(() => '');
-    throw new Error(`OPENAI_TTS_FAILED: ${err}`);
-  }
-
-  return Buffer.from(await resp.arrayBuffer());
-}
-
-/**
- * Past telefoon-DSP toe en zet om naar 8 kHz pcm_mulaw wav.
- * Resultaat klinkt beter over PSTN.
- */
-function applyPhoneDSP(inputBuf, outPath) {
-  return new Promise((resolve, reject) => {
-    const tempIn = path.join('/tmp', `tts_in_${Date.now()}.mp3`);
-    fs.writeFileSync(tempIn, inputBuf);
-
-    const args = [
-      '-y',
-      '-i',
-      tempIn,
-      '-af',
-      'highpass=f=300, lowpass=f=3400, equalizer=f=2700:t=q:w=2:g=6, compand=attacks=0:decays=0:points=-80/-80|-12/-3|0/-3, dynaudnorm',
-      '-ar',
-      '8000',
-      '-ac',
-      '1',
-      '-c:a',
-      'pcm_mulaw',
-      outPath
-    ];
-
-    execFile('ffmpeg', args, err => {
-      try {
-        fs.unlinkSync(tempIn);
-      } catch (_) {}
-
-      if (err) {
-        console.error('❌ ffmpeg error in applyPhoneDSP:', err.message);
-        return reject(err);
-      }
-
-      resolve(outPath);
-    });
-  });
-}
-
 // ---------- Trello config ----------
 
 const TRELLO_KEY = process.env.TRELLO_KEY;
@@ -175,6 +60,13 @@ const serverStats = {
 };
 
 // ---------- Telefoonnummer normalisatie (NL + varianten) ----------
+// Ondersteunt o.a.:
+// 06-42125400
+// 06 42125400
+// 31642125400
+// 632125400   (6 + 8 cijfers)
+// +31(0)642125400
+// +31642125400 (blijft zo)
 
 function normalizePhone(raw) {
   if (!raw) return null;
@@ -202,7 +94,7 @@ function normalizePhone(raw) {
 
   // NL mobiel: 06xxxxxxxx (10 cijfers) -> +316xxxxxxxx
   if (digitsOnly.length === 10 && digitsOnly.startsWith('06')) {
-    const withoutZero = digitsOnly.slice(1);
+    const withoutZero = digitsOnly.slice(1); // strip leading 0
     const e164 = `+31${withoutZero}`;
     console.log(`🔄 Normalized NL mobile ${raw} -> ${e164}`);
     return e164;
@@ -273,7 +165,9 @@ async function triggerCall(phoneRaw) {
 // ---------- Trello poller ----------
 
 async function pollTrelloLeads() {
-  if (!TRELLO_KEY || !TRELLO_TOKEN || !TRELLO_LIST_ID) return;
+  if (!TRELLO_KEY || !TRELLO_TOKEN || !TRELLO_LIST_ID) {
+    return;
+  }
 
   console.log('🔁 Polling Trello list for new leads...');
 
@@ -297,6 +191,8 @@ async function pollTrelloLeads() {
       if (hasCalled) continue;
 
       const desc = card.desc || '';
+
+      // Pak telefoonnummer inclusief spaties, streepjes, haakjes
       const match = desc.match(/(\+?[0-9][0-9()\-\s]{7,20})/);
 
       if (!match) {
@@ -311,9 +207,11 @@ async function pollTrelloLeads() {
         await triggerCall(phoneRaw);
       } catch (err) {
         console.error(`❌ Call failed for card ${card.id}:`, err.message);
+        // Geen label zetten bij mislukte call
         continue;
       }
 
+      // Zet label GEBELD zodat we nooit dubbel bellen
       const labelUrl = `https://api.trello.com/1/cards/${card.id}/labels?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
       const labelRes = await fetch(labelUrl, {
         method: 'POST',
@@ -333,11 +231,12 @@ async function pollTrelloLeads() {
   }
 }
 
+// elke 15 seconden pollen
 setInterval(pollTrelloLeads, 15000);
 
-// ---------- HTTP server (health, TwiML, tests, TTS-demo) ----------
+// ---------- HTTP server (health, TwiML, call-test) ----------
 
-const httpServer = http.createServer(async (req, res) => {
+const httpServer = http.createServer((req, res) => {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -416,158 +315,6 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // ElevenLabs test endpoint → /test-eleven?text=...
-  if (req.url.startsWith('/test-eleven') && req.method === 'GET') {
-    const urlObj = new URL(req.url, `http://${req.headers.host}`);
-    const text =
-      urlObj.searchParams.get('text') ||
-      'Hallo, ik ben Tessa, de AI-salesmachine. Dit is een test van ElevenLabs.';
-
-    console.log(`🔊 /test-eleven triggered with text: "${text}"`);
-
-    try {
-      const audioBuf = await synthesizeWithElevenLabs(text);
-      res.writeHead(200, { 'Content-Type': 'audio/mpeg' });
-      res.end(audioBuf);
-    } catch (e) {
-      console.error('❌ ElevenLabs test error:', e.message);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-
-    return;
-  }
-
-  // OpenAI TTS + DSP preview → /tts-preview?text=...
-  if (req.url.startsWith('/tts-preview') && req.method === 'GET') {
-    const urlObj = new URL(req.url, `http://${req.headers.host}`);
-    const text = urlObj.searchParams.get('text') || 'Dit is een test van Tessa.';
-
-    console.log(`🔊 /tts-preview triggered with text: "${text}"`);
-
-    try {
-      const raw = await generateOpenAITTS(text);
-      const outFile = path.join('/tmp', `tts_phone_${Date.now()}.wav`);
-      await applyPhoneDSP(raw, outFile);
-
-      const audio = fs.readFileSync(outFile);
-      res.writeHead(200, { 'Content-Type': 'audio/wav' });
-      res.end(audio);
-
-      try {
-        fs.unlinkSync(outFile);
-      } catch (_) {}
-    } catch (e) {
-      console.error('❌ TTS preview error:', e.message);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  // Static serve van tijdelijke audio-bestanden → /audio-temp/<file>
-  if (req.url.startsWith('/audio-temp/') && req.method === 'GET') {
-    const file = req.url.replace('/audio-temp/', '');
-    const full = path.join('/tmp', file);
-    if (!fs.existsSync(full)) {
-      res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('Not found');
-      return;
-    }
-    const data = fs.readFileSync(full);
-    res.writeHead(200, { 'Content-Type': 'audio/wav' });
-    res.end(data);
-    return;
-  }
-
-  // TwiML voor het afspelen van een gegenereerd TTS-bestand
-  if (req.url.startsWith('/twiml-play') && req.method === 'POST') {
-    if (!PUBLIC_BASE_URL) {
-      res.writeHead(500, { 'Content-Type': 'text/xml' });
-      res.end('<Response><Say>Server misconfigured</Say></Response>');
-      return;
-    }
-
-    const urlObj = new URL(req.url, `http://${req.headers.host}`);
-    const file = urlObj.searchParams.get('file');
-    if (!file) {
-      res.writeHead(400, { 'Content-Type': 'text/xml' });
-      res.end('<Response><Say>Missing audio file</Say></Response>');
-      return;
-    }
-
-    const audioUrl = `${PUBLIC_BASE_URL}/audio-temp/${file}`;
-    console.log(`🎵 /twiml-play serving audio: ${audioUrl}`);
-
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>${audioUrl}</Play>
-</Response>`;
-
-    res.writeHead(200, { 'Content-Type': 'text/xml' });
-    res.end(twiml);
-    return;
-  }
-
-  // OpenAI TTS + DSP bel-demo → /call-tts-test?phone=...&text=...
-  if (req.url.startsWith('/call-tts-test') && req.method === 'GET') {
-    const urlObj = new URL(req.url, `http://${req.headers.host}`);
-    const phone = urlObj.searchParams.get('phone');
-    const text =
-      urlObj.searchParams.get('text') || 'Hallo, dit is een test met Tessa over de telefoon.';
-
-    if (!phone) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Missing phone parameter' }));
-      return;
-    }
-
-    if (!twilioClient || !TWILIO_FROM || !PUBLIC_BASE_URL) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          error: 'Twilio or PUBLIC_BASE_URL not configured for call-tts-test'
-        })
-      );
-      return;
-    }
-
-    console.log(`📞 /call-tts-test triggered for: ${phone}, text="${text}"`);
-
-    try {
-      const normalized = normalizePhone(phone);
-      if (!normalized) {
-        throw new Error(`Cannot normalize phone number: ${phone}`);
-      }
-
-      const raw = await generateOpenAITTS(text);
-      const outFileBase = `tts_call_${Date.now()}.wav`;
-      const outFile = path.join('/tmp', outFileBase);
-      await applyPhoneDSP(raw, outFile);
-
-      const twimlUrl = `${PUBLIC_BASE_URL}/twiml-play?file=${encodeURIComponent(outFileBase)}`;
-
-      const call = await twilioClient.calls.create({
-        to: normalized,
-        from: TWILIO_FROM,
-        url: twimlUrl
-      });
-
-      console.log(
-        `[${new Date().toISOString()}] TTS demo call created: CallSid=${call.sid}, To=${normalized}, TwiML=${twimlUrl}`
-      );
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'calling', phone: normalized }));
-    } catch (e) {
-      console.error('❌ call-tts-test error:', e.message);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-
-    return;
-  }
-
   // Fallback 404
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not Found' }));
@@ -583,8 +330,7 @@ httpServer.listen(PORT, () => {
   console.log(`[${new Date().toISOString()}] Health check: http://localhost:${PORT}/health`);
 });
 
-// Twilio connection handler met realtime DSP
-
+// Twilio connection handler
 function handleTwilioConnection(twilioWs, clientId) {
   console.log(`[${new Date().toISOString()}] Setting up Twilio media stream for: ${clientId}`);
 
@@ -594,74 +340,6 @@ function handleTwilioConnection(twilioWs, clientId) {
   let responseStartTimestamp = null;
   let audioChunkCount = 0;
   let isResponseActive = false;
-
-  // ffmpeg realtime DSP-proces: PCM16 (16k) -> DSP -> 8kHz pcm_mulaw
-  const ffmpegArgs = [
-  '-f', 's16le',
-  '-ar', '16000',
-  '-ac', '1',
-  '-i', 'pipe:0',
-  '-af',
-  // pitch +10% (asetrate+atempo) + telefoon-EQ
-  'asetrate=18800,atempo=0.851,highpass=f=300,lowpass=f=3400,equalizer=f=3100:t=q:w=2:g=5,compand=attacks=0:decays=0:points=-80/-80|-18/-6|0/-3,dynaudnorm',
-  '-ar', '8000',
-  '-ac', '1',
-  '-c:a', 'pcm_mulaw',
-  '-f', 'mulaw',
-  'pipe:1'
-];
-
-  const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
-  let mulawBuffer = Buffer.alloc(0);
-
-  ffmpegProc.stderr.on('data', data => {
-    // Debugging evt:
-    // console.log(`[ffmpeg ${clientId}]`, data.toString());
-  });
-
-  ffmpegProc.on('error', err => {
-    serverStats.totalErrors++;
-    console.error(`[${new Date().toISOString()}] ffmpeg realtime error (${clientId}):`, err.message);
-  });
-
-  ffmpegProc.on('close', code => {
-    console.log(
-      `[${new Date().toISOString()}] ffmpeg realtime closed for ${clientId} with code ${code}`
-    );
-  });
-
-  // Alles wat uit ffmpeg komt is mulaw op 8 kHz -> naar Twilio
-  ffmpegProc.stdout.on('data', data => {
-    if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
-
-    mulawBuffer = Buffer.concat([mulawBuffer, data]);
-
-    const frameSize = 160; // 20ms @ 8000 Hz mono, 1 byte/sample (mulaw)
-    while (mulawBuffer.length >= frameSize) {
-      const frame = mulawBuffer.subarray(0, frameSize);
-      mulawBuffer = mulawBuffer.subarray(frameSize);
-
-      const payload = frame.toString('base64');
-      const audioPayload = {
-        event: 'media',
-        streamSid,
-        media: { payload }
-      };
-
-      twilioWs.send(JSON.stringify(audioPayload));
-    }
-  });
-
-  function cleanupRealtime() {
-    if (ffmpegProc && !ffmpegProc.killed) {
-      try {
-        ffmpegProc.stdin.end();
-      } catch (_) {}
-      try {
-        ffmpegProc.kill('SIGTERM');
-      } catch (_) {}
-    }
-  }
 
   // Connect to OpenAI Realtime API
   const openaiWs = new WebSocket(
@@ -688,8 +366,8 @@ function handleTwilioConnection(twilioWs, clientId) {
         modalities: ['audio', 'text'],
         instructions: INSTRUCTIONS,
         voice: VOICE,
-        input_audio_format: 'g711_ulaw', // van Twilio binnenkomend
-        output_audio_format: 'pcm16',     // high quality naar ons
+        input_audio_format: 'g711_ulaw',
+        output_audio_format: 'g711_ulaw',
         input_audio_transcription: {
           model: 'whisper-1'
         },
@@ -711,25 +389,7 @@ function handleTwilioConnection(twilioWs, clientId) {
       `[${new Date().toISOString()}] Session config sent:`,
       JSON.stringify(sessionConfig)
     );
-
-    // Eerste begroeting
-    setTimeout(() => {
-      if (openaiWs.readyState === WebSocket.OPEN) {
-        const greetingMessage = {
-          type: 'response.create',
-          response: {
-            modalities: ['audio', 'text'],
-            instructions:
-              'Groet de beller warm in het Nederlands en vraag hoe je hen vandaag kunt helpen.',
-            voice: VOICE
-          }
-        };
-        openaiWs.send(JSON.stringify(greetingMessage));
-        console.log(
-          `[${new Date().toISOString()}] Initial greeting triggered for: ${clientId}`
-        );
-      }
-    }, 250);
+    console.log(`[${new Date().toISOString()}] Waiting for user to speak first - no automatic greeting`);
   });
 
   // Twilio → OpenAI audio
@@ -763,7 +423,6 @@ function handleTwilioConnection(twilioWs, clientId) {
           if (openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.close();
           }
-          cleanupRealtime();
           break;
 
         default:
@@ -777,7 +436,7 @@ function handleTwilioConnection(twilioWs, clientId) {
     }
   });
 
-  // OpenAI → Twilio audio + events (nu via ffmpeg DSP)
+  // OpenAI → Twilio audio + events
   openaiWs.on('message', data => {
     try {
       const event = JSON.parse(data);
@@ -796,10 +455,12 @@ function handleTwilioConnection(twilioWs, clientId) {
           twilioWs.send(
             JSON.stringify({
               event: 'clear',
-              streamSid
+              streamSid: streamSid
             })
           );
         }
+
+        // hier kun je in nieuwe chat eventueel silenceTimer resetten etc.
       }
 
       if (event.type === 'response.output_item.added') {
@@ -810,6 +471,14 @@ function handleTwilioConnection(twilioWs, clientId) {
         console.log(
           `[${new Date().toISOString()}] 🎤 New response started - waiting for audio chunks...`
         );
+      }
+
+      // Collect transcript text for hangup detection
+      if (event.type === 'response.audio_transcript.delta' && event.delta) {
+        if (!lastAssistantItem.transcript) {
+          lastAssistantItem.transcript = '';
+        }
+        lastAssistantItem.transcript += event.delta.toLowerCase();
       }
 
       if (event.type === 'response.cancelled') {
@@ -841,13 +510,26 @@ function handleTwilioConnection(twilioWs, clientId) {
       if (event.type === 'response.audio.delta' && event.delta) {
         audioChunkCount++;
         console.log(
-          `[${new Date().toISOString()}] 🔊 PCM16 audio chunk #${audioChunkCount} from OpenAI`
+          `[${new Date().toISOString()}] 🔊 Audio chunk #${audioChunkCount} received from OpenAI (${event.delta.length} bytes)`
         );
 
-        // event.delta is base64-encoded PCM16 (16kHz, mono)
-        const pcmBuf = Buffer.from(event.delta, 'base64');
-        if (ffmpegProc && !ffmpegProc.killed) {
-          ffmpegProc.stdin.write(pcmBuf);
+        const audioPayload = {
+          event: 'media',
+          streamSid: streamSid,
+          media: {
+            payload: event.delta
+          }
+        };
+
+        if (twilioWs.readyState === WebSocket.OPEN) {
+          twilioWs.send(JSON.stringify(audioPayload));
+          console.log(
+            `[${new Date().toISOString()}] ✅ Audio chunk #${audioChunkCount} forwarded to Twilio`
+          );
+        } else {
+          console.error(
+            `[${new Date().toISOString()}] ❌ Failed to forward audio chunk #${audioChunkCount} - Twilio WS not open`
+          );
         }
       }
 
@@ -859,7 +541,7 @@ function handleTwilioConnection(twilioWs, clientId) {
 
       if (event.type === 'response.done') {
         console.log(
-          `[${new Date().toISOString()}] Response completed for call: ${callSid} - Total PCM chunks: ${audioChunkCount}`
+          `[${new Date().toISOString()}] Response completed for call: ${callSid} - Total audio chunks sent: ${audioChunkCount}`
         );
         isResponseActive = false;
 
@@ -867,6 +549,36 @@ function handleTwilioConnection(twilioWs, clientId) {
           console.warn(
             `[${new Date().toISOString()}] ⚠️ WARNING: Response completed but NO audio chunks were received from OpenAI!`
           );
+        }
+
+        if (lastAssistantItem && lastAssistantItem.transcript) {
+          const transcriptText = lastAssistantItem.transcript;
+          console.log(`[${new Date().toISOString()}] 📝 Full transcript: "${transcriptText}"`);
+
+          // HUIDIGE (te simpele) end-call detectie zit hier – in de nieuwe chat willen we dit vervangen
+          const endPhrases = [
+            'goodbye', 'bye', 'dag', 'doei', 'tot ziens',
+            'have a nice day', 'fijne dag', 'prettige dag',
+            'talk to you later', 'speak soon', 'tot later',
+            'have a good day', 'take care', 'pas goed op jezelf',
+            'end call', 'hanging up', 'ophangen'
+          ];
+
+          const shouldEndCall = endPhrases.some(phrase => transcriptText.includes(phrase));
+
+          if (shouldEndCall) {
+            console.log(`[${new Date().toISOString()}] 📞 Conversation ending detected - hanging up call in 3 seconds`);
+
+            setTimeout(() => {
+              if (twilioWs.readyState === WebSocket.OPEN) {
+                console.log(`[${new Date().toISOString()}] 📴 Closing Twilio connection to end call`);
+                twilioWs.close();
+              }
+              if (openaiWs.readyState === WebSocket.OPEN) {
+                openaiWs.close();
+              }
+            }, 3000);
+          }
         }
       }
 
@@ -894,7 +606,6 @@ function handleTwilioConnection(twilioWs, clientId) {
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.close();
     }
-    cleanupRealtime();
   });
 
   twilioWs.on('error', error => {
@@ -907,7 +618,6 @@ function handleTwilioConnection(twilioWs, clientId) {
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.close();
     }
-    cleanupRealtime();
   });
 
   openaiWs.on('close', code => {
@@ -919,7 +629,6 @@ function handleTwilioConnection(twilioWs, clientId) {
     if (twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.close();
     }
-    cleanupRealtime();
   });
 
   openaiWs.on('error', error => {
@@ -933,7 +642,6 @@ function handleTwilioConnection(twilioWs, clientId) {
     if (twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.close();
     }
-    cleanupRealtime();
   });
 }
 
@@ -1008,6 +716,3 @@ process.on('unhandledRejection', (reason, promise) => {
     reason
   );
 });
-
-
-
