@@ -351,32 +351,43 @@ function handleTwilioCall(twilioWs, clientId) {
   // 3. OpenAI → TEXT ONLY → We generate TTS per completed response
   // ----------------------------------------------------------
 
-  openaiWs.on("message", async (data) => {
-    const event = JSON.parse(data);
+let currentText = "";
 
-    // When OpenAI finishes generating a text response
-    if (event.type === "response.completed") {
-      const text = event.response?.output_text?.join(" ") || "";
-      if (!text) return;
+openaiWs.on("message", async (data) => {
+  const event = JSON.parse(data);
 
-      console.log("💬 Tessa says:", text);
+  // tekst komt in stukjes
+  if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
+    currentText += event.delta;
+  }
 
-      try {
-        // TTS → mp3
-        const mp3 = await generateTTS(text);
+  // tekst is klaar → TTS → DSP → naar Twilio
+  if (event.type === "response.output_text.done") {
+    const text = currentText.trim();
+    currentText = "";
+    if (!text) return;
 
-        // DSP → mulaw
-        const mulaw = await convertToPhoneMulaw(mp3);
+    console.log("💬 Tessa zegt:", text);
 
-        // SEND to Twilio as a single chunk
-        // (later we can split if needed)
-        sendMulawToTwilio(twilioWs, streamSid, mulaw);
+    try {
+      const mp3 = await generateTTS(text);
+      const mulaw = await convertToPhoneMulaw(mp3);
 
-      } catch (err) {
-        console.error("TTS/DSP error:", err.message);
+      const frameSize = 160; // 20ms @ 8kHz μ-law
+      for (let off = 0; off < mulaw.length; off += frameSize) {
+        const frame = mulaw.subarray(off, off + frameSize);
+        sendMulawToTwilio(twilioWs, streamSid, frame);
       }
+    } catch (err) {
+      console.error("TTS/DSP error:", err.message);
     }
-  });
+  }
+
+  if (event.type === "error") {
+    console.error("OpenAI error event:", JSON.stringify(event.error || event));
+  }
+});
+
 
   // ----------------------------------------------------------
   // 4. Cleanup
@@ -497,5 +508,6 @@ process.on("SIGTERM", shutdown);
 // ------------------------------------------------------------
 // END OF FILE
 // ============================================================
+
 
 
