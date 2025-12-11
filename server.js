@@ -164,7 +164,7 @@ function normalizePhone(raw) {
 }
 
 // ------------------------------------------------------------
-// Outbound call (Trello)
+// Outbound call (Trello / test)
 // ------------------------------------------------------------
 async function startOutboundCall(phone) {
   console.log("📞 Outbound call:", phone);
@@ -179,7 +179,7 @@ async function startOutboundCall(phone) {
 }
 
 // ------------------------------------------------------------
-// HTTP server (TwiML)
+// HTTP server (TwiML + health + call-test)
 // ------------------------------------------------------------
 const httpServer = http.createServer((req, res) => {
   if (req.url === "/health") {
@@ -240,6 +240,7 @@ function handleCall(twilioWs, id) {
 
   let streamSid = null;
   let partial = "";
+  let aiReady = false;
 
   // OpenAI realtime
   const ai = new WebSocket(
@@ -254,6 +255,7 @@ function handleCall(twilioWs, id) {
 
   ai.on("open", () => {
     console.log("✅ OpenAI connected");
+    aiReady = true;
 
     ai.send(
       JSON.stringify({
@@ -281,19 +283,26 @@ function handleCall(twilioWs, id) {
 
     if (msg.event === "start") {
       streamSid = msg.start.streamSid;
+      console.log("🔗 Twilio streamSid:", streamSid);
     }
 
     if (msg.event === "media") {
-      ai.send(
-        JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: msg.media.payload
-        })
-      );
+      if (aiReady && ai.readyState === WebSocket.OPEN) {
+        ai.send(
+          JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: msg.media.payload
+          })
+        );
+      } else {
+        // audio binnen vóór OpenAI open is → droppen
+        console.log("⏳ Dropping media, OpenAI not ready yet");
+      }
     }
 
     if (msg.event === "stop") {
-      ai.close();
+      console.log("🛑 Twilio STOP");
+      if (ai.readyState === WebSocket.OPEN) ai.close();
     }
   });
 
@@ -318,16 +327,18 @@ function handleCall(twilioWs, id) {
         const mulaw = await convertToMulaw(mp3);
         sendMulawToTwilio(twilioWs, streamSid, mulaw);
       } catch (e) {
-        console.error("Audio error:", e);
+        console.error("Audio error:", e.message);
       }
     }
   });
 
   ai.on("close", () => {
+    console.log("🛑 OpenAI closed");
     if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
   });
 
   twilioWs.on("close", () => {
+    console.log("🛑 Twilio closed");
     if (ai.readyState === WebSocket.OPEN) ai.close();
   });
 }
@@ -347,7 +358,10 @@ async function pollTrello() {
     const url = `https://api.trello.com/1/lists/${TRELLO_LIST_ID}/cards?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
     const res = await fetch(url);
 
-    if (!res.ok) return;
+    if (!res.ok) {
+      console.error("Trello error:", await res.text());
+      return;
+    }
 
     const cards = await res.json();
 
@@ -366,7 +380,6 @@ async function pollTrello() {
       try {
         await startOutboundCall(phone);
 
-        // Label card as called
         await fetch(
           `https://api.trello.com/1/cards/${card.id}/labels?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`,
           {
