@@ -600,7 +600,6 @@ function handleTwilioConnection(twilioWs, clientId) {
   let callSid = null;
 
   let isOpenAIConnected = false;
-  let currentAssistantText = '';
   let playingAudio = false;
   let stopCurrentTts = false;
 
@@ -774,22 +773,16 @@ function handleTwilioConnection(twilioWs, clientId) {
       return;
     }
 
-    // HIER WAS DE BUG: output_text.* → text.*
-    if (event.type === 'response.text.delta') {
-      if (typeof event.delta === 'string') {
-        currentAssistantText += event.delta;
-      }
-      return;
-    }
-
+    // ENIGE BELANGRIJKE STAP: response.text.done → ElevenLabs → Twilio
     if (event.type === 'response.text.done') {
-      // gebruik event.text als die er is, anders de accumulator
-      const text = (event.text || currentAssistantText).trim();
-      currentAssistantText = '';
+      const text = (event.text || '').trim();
 
-      if (!text) return;
+      if (!text) {
+        console.log(`[${new Date().toISOString()}] Assistant text empty, skipping TTS`);
+        return;
+      }
 
-      console.log(`[${new Date().toISOString()}] Assistant text: ${text}`);
+      console.log(`[${new Date().toISOString()}] Assistant text for TTS: ${text}`);
 
       const lower = text.toLowerCase();
       if (
@@ -800,24 +793,45 @@ function handleTwilioConnection(twilioWs, clientId) {
         farewellSpoken = true;
       }
 
-      if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
+      if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) {
+        console.log(
+          `[${new Date().toISOString()}] No valid Twilio streamSid or socket closed, skipping audio send`
+        );
+        return;
+      }
 
       try {
         playingAudio = true;
         stopCurrentTts = false;
 
+        console.log(
+          `[${new Date().toISOString()}] Calling ElevenLabs TTS (text length=${text.length})`
+        );
         const ulawBuffer = await synthesizeWithElevenLabs(text);
+        console.log(
+          `[${new Date().toISOString()}] ElevenLabs returned ${ulawBuffer.length} bytes ulaw`
+        );
+
         if (stopCurrentTts) {
           console.log(
-            `[${new Date().toISOString()}] Skipping TTS playback due to barge-in`
+            `[${new Date().toISOString()}] Skipping TTS playback due to barge-in after TTS ready`
           );
           return;
         }
 
+        let framesSent = 0;
+
         for (const chunk of ulawToTwilioChunks(ulawBuffer)) {
           if (stopCurrentTts) {
             console.log(
-              `[${new Date().toISOString()}] TTS playback interrupted mid-stream`
+              `[${new Date().toISOString()}] TTS playback interrupted mid-stream (frame=${framesSent})`
+            );
+            break;
+          }
+
+          if (twilioWs.readyState !== WebSocket.OPEN) {
+            console.log(
+              `[${new Date().toISOString()}] Twilio socket closed while sending audio (frame=${framesSent})`
             );
             break;
           }
@@ -829,12 +843,13 @@ function handleTwilioConnection(twilioWs, clientId) {
             media: { payload }
           };
 
-          if (twilioWs.readyState === WebSocket.OPEN) {
-            twilioWs.send(JSON.stringify(audioPayload));
-          } else {
-            break;
-          }
+          twilioWs.send(JSON.stringify(audioPayload));
+          framesSent++;
         }
+
+        console.log(
+          `[${new Date().toISOString()}] Finished sending ${framesSent} audio frames to Twilio`
+        );
 
         playingAudio = false;
       } catch (e) {
