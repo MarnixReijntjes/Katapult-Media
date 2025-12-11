@@ -740,6 +740,13 @@ function handleTwilioConnection(twilioWs, clientId) {
       return;
     }
 
+    // MINI-STAP: log alle OpenAI events raw
+    console.log(
+      `[${new Date().toISOString()}] OpenAI RAW event:`,
+      event.type,
+      JSON.stringify(event)
+    );
+
     if (event.type === 'input_audio_buffer.speech_started') {
       console.log(`[${new Date().toISOString()}] User speech started`);
       lastUserSpeechAt = Date.now();
