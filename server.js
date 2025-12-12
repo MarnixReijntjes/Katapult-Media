@@ -65,7 +65,6 @@ function normalizePhone(raw) {
 async function elevenTTSStreamToUlaw(text, pushUlaw) {
   if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) throw new Error('ELEVEN_NOT_CONFIGURED');
 
-  // We decode whatever Eleven returns (mp3 stream) and transcode to ulaw stream live.
   const ff = spawn('ffmpeg', [
     '-hide_banner',
     '-loglevel',
@@ -98,13 +97,11 @@ async function elevenTTSStreamToUlaw(text, pushUlaw) {
 
   if (!res.ok) {
     const err = await res.text().catch(() => '');
-    ff.stdin.end();
+    try { ff.stdin.end(); } catch (_) {}
     throw new Error(`ELEVEN_STREAM_FAILED ${res.status}: ${err}`);
   }
 
-  // Pipe response body to ffmpeg stdin
   try {
-    // Node 18+ fetch returns a web stream; convert to Node stream
     const { Readable } = await import('stream');
     const nodeStream = Readable.fromWeb(res.body);
     nodeStream.on('data', (d) => ff.stdin.write(d));
@@ -114,8 +111,7 @@ async function elevenTTSStreamToUlaw(text, pushUlaw) {
     nodeStream.on('error', () => {
       try { ff.stdin.end(); } catch (_) {}
     });
-  } catch (e) {
-    // Fallback: try arrayBuffer (won't be streaming, but won't break)
+  } catch (_) {
     const buf = Buffer.from(await res.arrayBuffer());
     ff.stdin.write(buf);
     ff.stdin.end();
@@ -200,11 +196,11 @@ wss.on('connection', (twilioWs) => {
 
   let elevenStartTestPlayed = false;
 
-  // assistant transcript aggregation per response
-  let transcriptBuf = '';
-  let transcriptSeen = false;
+  // assistant text aggregation per response
+  let textBuf = '';
+  let textSeen = false;
 
-  // simple speaking lock (no interrupt yet)
+  // speaking lock (no interrupt yet)
   let speaking = false;
 
   function sendUlawFrame(frame) {
@@ -259,13 +255,14 @@ wss.on('connection', (twilioWs) => {
   }
 
   openaiWs.on('open', () => {
+    // ✅ CHANGE: text-only session
     safeOpenAISend({
       type: 'session.update',
       session: {
-        modalities: ['audio', 'text'],
+        modalities: ['text'],
         instructions: INSTRUCTIONS,
+        // keep transcription enabled (audio in -> text out)
         input_audio_format: 'g711_ulaw',
-        output_audio_format: 'g711_ulaw',
         input_audio_transcription: { model: 'whisper-1' },
         turn_detection: {
           type: 'server_vad',
@@ -280,10 +277,11 @@ wss.on('connection', (twilioWs) => {
       }
     });
 
+    // Opening: we’ll speak via Eleven
     safeOpenAISend({
       type: 'response.create',
       response: {
-        modalities: ['audio', 'text'],
+        modalities: ['text'],
         instructions: 'Zeg exact de openingszin zoals beschreven, geen extra woorden.'
       }
     });
@@ -319,37 +317,42 @@ wss.on('connection', (twilioWs) => {
   openaiWs.on('message', async (raw) => {
     const evt = JSON.parse(raw);
 
+    // reset per response
     if (evt.type === 'response.created' || evt.type === 'response.output_item.added') {
-      transcriptBuf = '';
-      transcriptSeen = false;
+      textBuf = '';
+      textSeen = false;
+      return;
     }
 
-    if (evt.type === 'response.audio_transcript.delta' && typeof evt.delta === 'string') {
-      transcriptSeen = true;
-      transcriptBuf += evt.delta;
+    // ✅ Collect assistant text from multiple possible event names
+    // Some builds send response.text.delta, others response.output_text.delta
+    if ((evt.type === 'response.text.delta' || evt.type === 'response.output_text.delta') && typeof evt.delta === 'string') {
+      textSeen = true;
+      textBuf += evt.delta;
+      return;
     }
 
-    if (evt.type === 'response.audio_transcript.done') {
-      if (transcriptSeen) {
-        const text = transcriptBuf.trim();
-        transcriptBuf = '';
-        transcriptSeen = false;
+    // done events variants
+    if (evt.type === 'response.text.done' || evt.type === 'response.output_text.done') {
+      if (textSeen) {
+        const text = textBuf.trim();
+        textBuf = '';
+        textSeen = false;
         await speakElevenStreaming(text);
       }
       return;
     }
 
     if (evt.type === 'response.done') {
-      if (transcriptSeen && transcriptBuf.trim()) {
-        const text = transcriptBuf.trim();
-        transcriptBuf = '';
-        transcriptSeen = false;
+      if (textSeen && textBuf.trim()) {
+        const text = textBuf.trim();
+        textBuf = '';
+        textSeen = false;
         await speakElevenStreaming(text);
       }
       return;
     }
 
-    // We still ignore OpenAI audio output.
     if (evt.type === 'error') {
       console.error('❌ OpenAI error:', JSON.stringify(evt.error));
     }
