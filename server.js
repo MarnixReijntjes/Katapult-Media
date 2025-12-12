@@ -14,7 +14,6 @@ const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const INSTRUCTIONS = process.env.INSTRUCTIONS || '';
 const SPEED = parseFloat(process.env.SPEED || '1.0');
-const VOICE = process.env.VOICE || 'alloy';
 
 const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
@@ -88,6 +87,36 @@ async function elevenTTS(text) {
 }
 
 /* =======================
+   MP3 -> ULAW (8k) STREAM
+======================= */
+function streamMp3ToTwilioUlaw(mp3Buf, pushUlaw) {
+  return new Promise((resolve) => {
+    const proc = spawn('ffmpeg', [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-i',
+      'pipe:0',
+      '-ar',
+      '8000',
+      '-ac',
+      '1',
+      '-f',
+      'mulaw',
+      'pipe:1'
+    ]);
+
+    proc.on('error', () => resolve());
+    proc.on('close', () => resolve());
+
+    proc.stdout.on('data', (chunk) => pushUlaw(chunk));
+
+    proc.stdin.write(mp3Buf);
+    proc.stdin.end();
+  });
+}
+
+/* =======================
    HTTP SERVER
 ======================= */
 const httpServer = http.createServer(async (req, res) => {
@@ -157,21 +186,15 @@ const wss = new WebSocketServer({ server: httpServer });
 
 wss.on('connection', (twilioWs) => {
   let streamSid = null;
-  let greetingPlayed = false;
 
-  // MINI-STEP: speel 1 vaste ElevenLabs zin af bij start (hoorbaar bewijs)
+  // EL proof line once at start (keep it)
   let elevenStartTestPlayed = false;
 
-  const openaiWs = new WebSocket(
-    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1'
-      }
-    }
-  );
+  // assistant text aggregation per response
+  let assistantText = '';
+  let responseActive = false;
 
+  // Twilio audio framing
   function sendUlawFrame(frame) {
     if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
     twilioWs.send(
@@ -194,66 +217,55 @@ wss.on('connection', (twilioWs) => {
     }
   }
 
-  // Guard send to OpenAI (CONNECTING fix)
+  const openaiWs = new WebSocket(
+    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'OpenAI-Beta': 'realtime=v1'
+      }
+    }
+  );
+
   function safeOpenAISend(obj) {
     if (openaiWs.readyState !== WebSocket.OPEN) return;
     openaiWs.send(JSON.stringify(obj));
   }
 
-  async function playElevenLabsOnce(text) {
+  async function playEleven(text) {
+    const t = (text || '').trim();
+    if (!t) return;
     try {
-      const mp3 = await elevenTTS(text);
-
-      const proc = spawn('ffmpeg', [
-        '-hide_banner',
-        '-loglevel',
-        'error',
-        '-i',
-        'pipe:0',
-        '-ar',
-        '8000',
-        '-ac',
-        '1',
-        '-f',
-        'mulaw',
-        'pipe:1'
-      ]);
-
-      proc.on('error', (e) => {
-        console.error('❌ ffmpeg spawn error:', e.message);
-      });
-
-      proc.stdout.on('data', (chunk) => {
-        pushAndSendUlaw(chunk);
-      });
-
-      proc.stderr.on('data', (d) => {
-        console.error('❌ ffmpeg stderr:', d.toString());
-      });
-
-      proc.stdin.write(mp3);
-      proc.stdin.end();
+      const mp3 = await elevenTTS(t);
+      await streamMp3ToTwilioUlaw(mp3, pushAndSendUlaw);
     } catch (e) {
-      console.error('❌ ElevenLabs start test failed:', e.message);
+      console.error('❌ ElevenLabs speak failed:', e.message);
     }
   }
 
   openaiWs.on('open', () => {
+    // IMPORTANT: we want TEXT output only from OpenAI.
     safeOpenAISend({
       type: 'session.update',
       session: {
-        modalities: ['audio', 'text'],
+        modalities: ['text'], // <== OpenAI audio disabled
         instructions: INSTRUCTIONS,
-        voice: VOICE,
         input_audio_format: 'g711_ulaw',
-        output_audio_format: 'g711_ulaw',
         input_audio_transcription: { model: 'whisper-1' },
-        turn_detection: { type: 'server_vad', create_response: true },
+        turn_detection: {
+          type: 'server_vad',
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 500,
+          create_response: true
+        },
+        temperature: 0.7,
+        max_response_output_tokens: 800,
         speed: SPEED
       }
     });
 
-    // (blijft zoals het was)
+    // kick-off: ask for opening in text, then we play it via ElevenLabs
     safeOpenAISend({
       type: 'response.create',
       response: {
@@ -270,14 +282,10 @@ wss.on('connection', (twilioWs) => {
       streamSid = data.start.streamSid;
       console.log(`[${new Date().toISOString()}] Twilio start streamSid=${streamSid}`);
 
-      // ====== ENIGE NIEUWE LOGICA VAN DEZE STAP ======
       if (!elevenStartTestPlayed) {
         elevenStartTestPlayed = true;
-        // hoorbaar bewijs
-        playElevenLabsOnce('Test. Dit is de nieuwe ElevenLabs stem.');
+        playEleven('Test. Dit is de nieuwe ElevenLabs stem.');
       }
-      // ==============================================
-
       return;
     }
 
@@ -297,48 +305,38 @@ wss.on('connection', (twilioWs) => {
   openaiWs.on('message', async (raw) => {
     const evt = JSON.parse(raw);
 
-    // bestaande opening-branch blijft staan (maar jij hoeft logs niet te zien)
-    if (evt.type === 'response.output_text.done' && !greetingPlayed) {
-      greetingPlayed = true;
+    // start of response
+    if (evt.type === 'response.created') {
+      responseActive = true;
+      assistantText = '';
+    }
 
-      const text = (evt.text || '').trim();
-      // we laten dit staan, maar het is niet de “bewijs stap”
-      // (bewijs is nu de vaste zin bij start)
-      // play via ElevenLabs:
-      try {
-        const mp3 = await elevenTTS(text);
+    // accumulate text deltas (realtime uses these event names; if they differ, we still catch output_text.done below)
+    if (evt.type === 'response.output_text.delta' && typeof evt.delta === 'string') {
+      assistantText += evt.delta;
+    }
 
-        const proc = spawn('ffmpeg', [
-          '-hide_banner',
-          '-loglevel',
-          'error',
-          '-i',
-          'pipe:0',
-          '-ar',
-          '8000',
-          '-ac',
-          '1',
-          '-f',
-          'mulaw',
-          'pipe:1'
-        ]);
+    // some servers use output_text instead of delta
+    if (evt.type === 'response.output_text' && typeof evt.text === 'string') {
+      assistantText += evt.text;
+    }
 
-        proc.stdout.on('data', (chunk) => pushAndSendUlaw(chunk));
-        proc.stderr.on('data', (d) => console.error('❌ ffmpeg stderr:', d.toString()));
-        proc.on('error', (e) => console.error('❌ ffmpeg spawn error:', e.message));
-
-        proc.stdin.write(mp3);
-        proc.stdin.end();
-      } catch (e) {
-        console.error('❌ ElevenLabs opening failed:', e.message);
-      }
-
+    // done => speak via ElevenLabs
+    if (evt.type === 'response.output_text.done') {
+      const text = (evt.text || assistantText || '').trim();
+      responseActive = false;
+      assistantText = '';
+      await playEleven(text);
       return;
     }
 
-    // Rest: OpenAI audio
-    if (evt.type === 'response.audio.delta' && evt.delta) {
-      pushAndSendUlaw(Buffer.from(evt.delta, 'base64'));
+    // also handle response.done just in case output_text.done isn't sent
+    if (evt.type === 'response.done' && responseActive) {
+      const text = (assistantText || '').trim();
+      responseActive = false;
+      assistantText = '';
+      if (text) await playEleven(text);
+      return;
     }
 
     if (evt.type === 'error') {
@@ -363,4 +361,3 @@ wss.on('connection', (twilioWs) => {
 httpServer.listen(PORT, () => {
   console.log(`✅ Server live on ${PORT}`);
 });
-
