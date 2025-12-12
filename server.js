@@ -203,7 +203,7 @@ wss.on('connection', (twilioWs) => {
   // speaking lock
   let speaking = false;
 
-  // --- NEW: hangup state ---
+  // hangup state
   let farewellPending = false;
   let hangupTimer = null;
   let lastUserSpeechAt = 0;
@@ -215,19 +215,10 @@ wss.on('connection', (twilioWs) => {
     }
   }
 
-  // Heuristic: only arm hangup if Tessa explicitly closes.
-  function isFarewellText(t) {
-    const s = (t || '').toLowerCase();
-    return (
-      s.includes('tot ziens') ||
-      s.includes('fijne dag') ||
-      s.includes('fijne dag verder') ||
-      s.includes('bedankt voor uw tijd') ||
-      s.includes('ik wens u') ||
-      s.includes('dag hoor') ||
-      s.includes('doei') ||
-      s.includes('goodbye') ||
-      s.includes('have a nice day')
+  // ✅ CHANGE: only consider farewell if it is the END of the final assistant message
+  function isFinalFarewell(t) {
+    return /(?:tot ziens|fijne dag(?: verder)?|bedankt voor uw tijd|doei|dag hoor|goodbye|have a nice day)[.!?]*$/i.test(
+      (t || '').trim()
     );
   }
 
@@ -269,12 +260,6 @@ wss.on('connection', (twilioWs) => {
     if (!t) return;
     if (speaking) return;
 
-    // --- NEW: hangup detection on what we are about to speak ---
-    if (isFarewellText(t)) {
-      farewellPending = true;
-      // we arm after we finish speaking (see finally)
-    }
-
     speaking = true;
     try {
       await elevenTTSStreamToUlaw(t, pushAndSendUlaw);
@@ -282,10 +267,7 @@ wss.on('connection', (twilioWs) => {
       console.error('❌ Eleven streaming failed:', e.message);
     } finally {
       speaking = false;
-      // --- NEW: if we spoke farewell, hang up after 3s silence ---
-      if (farewellPending) {
-        armHangupAfterSilence(3000);
-      }
+      // NOTE: hangup arming happens after response.done (not here)
     }
   }
 
@@ -365,7 +347,7 @@ wss.on('connection', (twilioWs) => {
   openaiWs.on('message', async (raw) => {
     const evt = JSON.parse(raw);
 
-    // --- NEW: cancel hangup if caller starts talking again ---
+    // cancel hangup if caller starts talking again
     if (evt.type === 'input_audio_buffer.speech_started') {
       lastUserSpeechAt = Date.now();
       if (farewellPending) {
@@ -382,7 +364,10 @@ wss.on('connection', (twilioWs) => {
       return;
     }
 
-    if ((evt.type === 'response.text.delta' || evt.type === 'response.output_text.delta') && typeof evt.delta === 'string') {
+    if (
+      (evt.type === 'response.text.delta' || evt.type === 'response.output_text.delta') &&
+      typeof evt.delta === 'string'
+    ) {
       textSeen = true;
       textBuf += evt.delta;
       return;
@@ -398,12 +383,20 @@ wss.on('connection', (twilioWs) => {
       return;
     }
 
+    // ✅ CHANGE: farewell check ONLY here, on the final message end
     if (evt.type === 'response.done') {
       if (textSeen && textBuf.trim()) {
         const text = textBuf.trim();
         textBuf = '';
         textSeen = false;
+
+        const shouldHangup = isFinalFarewell(text);
         await speakElevenStreaming(text);
+
+        if (shouldHangup) {
+          farewellPending = true;
+          armHangupAfterSilence(3000);
+        }
       }
       return;
     }
