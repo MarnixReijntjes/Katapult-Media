@@ -19,6 +19,11 @@ const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_multilingual_v2';
 
+if (!OPENAI_API_KEY) {
+  console.error('❌ OPENAI_API_KEY missing');
+  process.exit(1);
+}
+
 /* =======================
    TWILIO
 ======================= */
@@ -34,17 +39,32 @@ const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 ======================= */
 function normalizePhone(raw) {
   if (!raw) return null;
-  const s = raw.replace(/\D/g, '');
+
+  const cleaned = raw.toString().trim();
+
+  // +... allowed
+  if (cleaned.startsWith('+')) {
+    const digits = cleaned.slice(1).replace(/\D/g, '');
+    if (!digits) return null;
+    return `+${digits}`;
+  }
+
+  const s = cleaned.replace(/\D/g, '');
+  if (!s) return null;
+
   if (s.startsWith('31') && s.length === 11) return `+${s}`;
   if (s.startsWith('06') && s.length === 10) return `+31${s.slice(1)}`;
   if (s.startsWith('6') && s.length === 9) return `+316${s.slice(1)}`;
+
   return null;
 }
 
 /* =======================
-   ELEVENLABS → μLAW
+   ELEVENLABS → μLAW (stream)
 ======================= */
 async function elevenSpeak(text, onUlaw) {
+  if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) throw new Error('ELEVEN_NOT_CONFIGURED');
+
   const ff = spawn('ffmpeg', [
     '-hide_banner',
     '-loglevel', 'error',
@@ -73,10 +93,16 @@ async function elevenSpeak(text, onUlaw) {
     }
   );
 
+  if (!res.ok) {
+    const err = await res.text().catch(() => '');
+    try { ff.stdin.end(); } catch {}
+    throw new Error(`ELEVEN_STREAM_FAILED ${res.status}: ${err}`);
+  }
+
   const { Readable } = await import('stream');
   Readable.fromWeb(res.body).pipe(ff.stdin);
 
-  await new Promise(r => ff.on('close', r));
+  await new Promise((r) => ff.on('close', r));
 }
 
 /* =======================
@@ -95,15 +121,15 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.url.startsWith('/call-test')) {
+  if (req.url.startsWith('/call-test') && req.method === 'GET') {
     try {
       const url = new URL(req.url, `http://${req.headers.host}`);
       const raw = url.searchParams.get('phone');
       const phone = normalizePhone(raw);
 
       if (!phone) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: 'Invalid phone number' }));
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Invalid phone number: ${raw}` }));
         return;
       }
 
@@ -117,8 +143,8 @@ const httpServer = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ ok: true, to: phone, sid: call.sid }));
       return;
     } catch (e) {
-      console.error('❌ call-test error', e.message);
-      res.writeHead(500);
+      console.error('❌ /call-test error:', e.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: e.message }));
       return;
     }
@@ -134,25 +160,53 @@ const httpServer = http.createServer(async (req, res) => {
 const wss = new WebSocketServer({ server: httpServer });
 
 wss.on('connection', (twilioWs) => {
-  let streamSid;
+  let streamSid = null;
+
+  // OPENAI WS readiness + small audio buffer until OPEN
+  let openaiReady = false;
+  const pendingAudio = []; // array of base64 payload strings
+  const MAX_PENDING = 50;  // ~1s-ish depending on frame size
+
   let speaking = false;
   let hasUserSpoken = false;
-  let textBuf = Buffer.from('');
 
-  function sendUlaw(frame) {
+  // text aggregation
+  let textBuf = '';
+
+  function safeTwilioSend(obj) {
     if (twilioWs.readyState !== WebSocket.OPEN) return;
-    twilioWs.send(JSON.stringify({
-      event: 'media',
-      streamSid,
-      media: { payload: frame.toString('base64') }
-    }));
+    try {
+      twilioWs.send(JSON.stringify(obj));
+    } catch (_) {}
+  }
+
+  function onUlawChunk(chunk) {
+    if (!streamSid) return;
+    // chunk may be >160; split to 20ms frames
+    let buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    while (buf.length >= 160) {
+      const frame = buf.subarray(0, 160);
+      buf = buf.subarray(160);
+      safeTwilioSend({
+        event: 'media',
+        streamSid,
+        media: { payload: frame.toString('base64') }
+      });
+    }
   }
 
   async function speak(text) {
+    const t = (text || '').trim();
+    if (!t) return;
     if (speaking) return;
     speaking = true;
-    await elevenSpeak(text, sendUlaw);
-    speaking = false;
+    try {
+      await elevenSpeak(t, onUlawChunk);
+    } catch (e) {
+      console.error('❌ Eleven error:', e.message);
+    } finally {
+      speaking = false;
+    }
   }
 
   const openaiWs = new WebSocket(
@@ -165,8 +219,20 @@ wss.on('connection', (twilioWs) => {
     }
   );
 
+  function safeOpenAISend(obj) {
+    if (openaiWs.readyState !== WebSocket.OPEN) return false;
+    try {
+      openaiWs.send(JSON.stringify(obj));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   openaiWs.on('open', () => {
-    openaiWs.send(JSON.stringify({
+    openaiReady = true;
+
+    safeOpenAISend({
       type: 'session.update',
       session: {
         modalities: ['text'],
@@ -181,46 +247,103 @@ wss.on('connection', (twilioWs) => {
         temperature: 0.7,
         speed: SPEED
       }
-    }));
+    });
+
+    // flush buffered audio
+    while (pendingAudio.length) {
+      const payload = pendingAudio.shift();
+      safeOpenAISend({ type: 'input_audio_buffer.append', audio: payload });
+    }
+  });
+
+  openaiWs.on('close', () => {
+    openaiReady = false;
+    try { if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close(); } catch {}
+  });
+
+  openaiWs.on('error', (e) => {
+    openaiReady = false;
+    console.error('❌ OpenAI WS error:', e.message);
+    try { if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close(); } catch {}
   });
 
   twilioWs.on('message', (msg) => {
-    const data = JSON.parse(msg);
+    try {
+      const data = JSON.parse(msg);
 
-    if (data.event === 'start') {
-      streamSid = data.start.streamSid;
-      return;
-    }
+      if (data.event === 'start') {
+        streamSid = data.start.streamSid;
+        console.log(`[${new Date().toISOString()}] Twilio start streamSid=${streamSid}`);
+        return;
+      }
 
-    if (data.event === 'media') {
-      openaiWs.send(JSON.stringify({
-        type: 'input_audio_buffer.append',
-        audio: data.media.payload
-      }));
+      if (data.event === 'media') {
+        const payload = data.media?.payload;
+        if (!payload) return;
+
+        // buffer until OpenAI ready; DO NOT crash
+        if (!openaiReady || openaiWs.readyState !== WebSocket.OPEN) {
+          pendingAudio.push(payload);
+          if (pendingAudio.length > MAX_PENDING) pendingAudio.shift(); // drop oldest
+          return;
+        }
+
+        safeOpenAISend({ type: 'input_audio_buffer.append', audio: payload });
+        return;
+      }
+
+      if (data.event === 'stop') {
+        console.log(`[${new Date().toISOString()}] Twilio stop streamSid=${streamSid}`);
+        try { if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); } catch {}
+        return;
+      }
+    } catch (e) {
+      console.error('❌ Twilio message parse error:', e.message);
     }
   });
 
   openaiWs.on('message', async (raw) => {
-    const evt = JSON.parse(raw);
+    try {
+      const evt = JSON.parse(raw);
 
-    if (evt.type === 'input_audio_buffer.speech_stopped' && !hasUserSpoken) {
-      hasUserSpoken = true;
-      openaiWs.send(JSON.stringify({
-        type: 'response.create',
-        response: { modalities: ['text'] }
-      }));
-      return;
-    }
+      // you speak first: create response only after first speech_stopped
+      if (evt.type === 'input_audio_buffer.speech_stopped' && !hasUserSpoken) {
+        hasUserSpoken = true;
+        safeOpenAISend({ type: 'response.create', response: { modalities: ['text'] } });
+        return;
+      }
 
-    if (evt.type === 'response.text.delta') {
-      textBuf = Buffer.concat([textBuf, Buffer.from(evt.delta)]);
-    }
+      // accept both delta names
+      if (
+        (evt.type === 'response.text.delta' || evt.type === 'response.output_text.delta') &&
+        typeof evt.delta === 'string'
+      ) {
+        textBuf += evt.delta;
+        return;
+      }
 
-    if (evt.type === 'response.text.done') {
-      const text = textBuf.toString().trim();
-      textBuf = Buffer.alloc(0);
-      if (text) await speak(text);
+      // accept both done names
+      if (evt.type === 'response.text.done' || evt.type === 'response.output_text.done') {
+        const text = (textBuf || '').trim();
+        textBuf = '';
+        if (text) await speak(text);
+        return;
+      }
+
+      if (evt.type === 'error') {
+        console.error('❌ OpenAI error event:', JSON.stringify(evt.error));
+      }
+    } catch (e) {
+      console.error('❌ OpenAI message parse error:', e.message);
     }
+  });
+
+  twilioWs.on('close', () => {
+    try { if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); } catch {}
+  });
+
+  twilioWs.on('error', () => {
+    try { if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); } catch {}
   });
 });
 
