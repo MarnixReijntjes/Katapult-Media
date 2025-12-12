@@ -180,7 +180,6 @@ wss.on('connection', (twilioWs) => {
     );
   }
 
-  // g711_ulaw frames are 160 bytes (20ms @ 8k)
   let ulawBuffer = Buffer.alloc(0);
   function pushAndSendUlaw(chunk) {
     ulawBuffer = Buffer.concat([ulawBuffer, chunk]);
@@ -221,6 +220,12 @@ wss.on('connection', (twilioWs) => {
     );
   });
 
+  // === MINI FIX: guard openaiWs.send while CONNECTING ===
+  function safeOpenAISend(obj) {
+    if (openaiWs.readyState !== WebSocket.OPEN) return;
+    openaiWs.send(JSON.stringify(obj));
+  }
+
   twilioWs.on('message', (msg) => {
     const data = JSON.parse(msg);
 
@@ -231,12 +236,10 @@ wss.on('connection', (twilioWs) => {
     }
 
     if (data.event === 'media') {
-      openaiWs.send(
-        JSON.stringify({
-          type: 'input_audio_buffer.append',
-          audio: data.media.payload
-        })
-      );
+      safeOpenAISend({
+        type: 'input_audio_buffer.append',
+        audio: data.media.payload
+      });
     }
 
     if (data.event === 'stop') {
@@ -248,7 +251,6 @@ wss.on('connection', (twilioWs) => {
   openaiWs.on('message', async (raw) => {
     const evt = JSON.parse(raw);
 
-    // === ENIGE NIEUWE LOGICA VOOR DEZE STAP: opening tekst -> ElevenLabs -> ulaw -> Twilio ===
     if (evt.type === 'response.output_text.done' && !greetingPlayed) {
       greetingPlayed = true;
 
@@ -296,10 +298,8 @@ wss.on('connection', (twilioWs) => {
       return;
     }
 
-    // === REST: OpenAI audio blijft zoals het was (fallback) ===
     if (evt.type === 'response.audio.delta' && evt.delta) {
-      const ulawChunk = Buffer.from(evt.delta, 'base64');
-      pushAndSendUlaw(ulawChunk);
+      pushAndSendUlaw(Buffer.from(evt.delta, 'base64'));
     }
 
     if (evt.type === 'error') {
