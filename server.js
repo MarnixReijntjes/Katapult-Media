@@ -108,7 +108,6 @@ function streamMp3ToTwilioUlaw(mp3Buf, pushUlaw) {
 
     proc.on('error', () => resolve());
     proc.on('close', () => resolve());
-
     proc.stdout.on('data', (chunk) => pushUlaw(chunk));
 
     proc.stdin.write(mp3Buf);
@@ -187,14 +186,14 @@ const wss = new WebSocketServer({ server: httpServer });
 wss.on('connection', (twilioWs) => {
   let streamSid = null;
 
-  // EL proof line once at start (keep it)
+  // audible proof stays
   let elevenStartTestPlayed = false;
 
-  // assistant text aggregation per response
-  let assistantText = '';
-  let responseActive = false;
+  // assistant transcript aggregation per response
+  let transcriptBuf = '';
+  let transcriptSeenForCurrentResponse = false;
+  let speaking = false;
 
-  // Twilio audio framing
   function sendUlawFrame(frame) {
     if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
     twilioWs.send(
@@ -232,25 +231,30 @@ wss.on('connection', (twilioWs) => {
     openaiWs.send(JSON.stringify(obj));
   }
 
-  async function playEleven(text) {
+  async function speakEleven(text) {
     const t = (text || '').trim();
     if (!t) return;
+    if (speaking) return; // minimal guard, no interrupt yet
+    speaking = true;
     try {
       const mp3 = await elevenTTS(t);
       await streamMp3ToTwilioUlaw(mp3, pushAndSendUlaw);
     } catch (e) {
       console.error('❌ ElevenLabs speak failed:', e.message);
+    } finally {
+      speaking = false;
     }
   }
 
   openaiWs.on('open', () => {
-    // IMPORTANT: we want TEXT output only from OpenAI.
+    // Key change: keep audio+text so we reliably get response.audio_transcript.*
     safeOpenAISend({
       type: 'session.update',
       session: {
-        modalities: ['text'], // <== OpenAI audio disabled
+        modalities: ['audio', 'text'],
         instructions: INSTRUCTIONS,
         input_audio_format: 'g711_ulaw',
+        output_audio_format: 'g711_ulaw',
         input_audio_transcription: { model: 'whisper-1' },
         turn_detection: {
           type: 'server_vad',
@@ -265,11 +269,11 @@ wss.on('connection', (twilioWs) => {
       }
     });
 
-    // kick-off: ask for opening in text, then we play it via ElevenLabs
+    // Force first response quickly (opening). We'll speak its transcript via EL.
     safeOpenAISend({
       type: 'response.create',
       response: {
-        modalities: ['text'],
+        modalities: ['audio', 'text'],
         instructions: 'Zeg exact de openingszin zoals beschreven, geen extra woorden.'
       }
     });
@@ -284,7 +288,7 @@ wss.on('connection', (twilioWs) => {
 
       if (!elevenStartTestPlayed) {
         elevenStartTestPlayed = true;
-        playEleven('Test. Dit is de nieuwe ElevenLabs stem.');
+        speakEleven('Test. Dit is de nieuwe ElevenLabs stem.');
       }
       return;
     }
@@ -305,39 +309,42 @@ wss.on('connection', (twilioWs) => {
   openaiWs.on('message', async (raw) => {
     const evt = JSON.parse(raw);
 
-    // start of response
-    if (evt.type === 'response.created') {
-      responseActive = true;
-      assistantText = '';
+    // new response started -> reset buffer
+    if (evt.type === 'response.output_item.added' || evt.type === 'response.created') {
+      transcriptBuf = '';
+      transcriptSeenForCurrentResponse = false;
     }
 
-    // accumulate text deltas (realtime uses these event names; if they differ, we still catch output_text.done below)
-    if (evt.type === 'response.output_text.delta' && typeof evt.delta === 'string') {
-      assistantText += evt.delta;
+    // THIS is what we convert to ElevenLabs
+    if (evt.type === 'response.audio_transcript.delta' && typeof evt.delta === 'string') {
+      transcriptSeenForCurrentResponse = true;
+      transcriptBuf += evt.delta;
     }
 
-    // some servers use output_text instead of delta
-    if (evt.type === 'response.output_text' && typeof evt.text === 'string') {
-      assistantText += evt.text;
-    }
-
-    // done => speak via ElevenLabs
-    if (evt.type === 'response.output_text.done') {
-      const text = (evt.text || assistantText || '').trim();
-      responseActive = false;
-      assistantText = '';
-      await playEleven(text);
+    if (evt.type === 'response.audio_transcript.done') {
+      // speak once per response
+      if (transcriptSeenForCurrentResponse) {
+        const text = transcriptBuf.trim();
+        transcriptBuf = '';
+        transcriptSeenForCurrentResponse = false;
+        await speakEleven(text);
+      }
       return;
     }
 
-    // also handle response.done just in case output_text.done isn't sent
-    if (evt.type === 'response.done' && responseActive) {
-      const text = (assistantText || '').trim();
-      responseActive = false;
-      assistantText = '';
-      if (text) await playEleven(text);
+    if (evt.type === 'response.done') {
+      // fallback if .done wasn't fired
+      if (transcriptSeenForCurrentResponse && transcriptBuf.trim()) {
+        const text = transcriptBuf.trim();
+        transcriptBuf = '';
+        transcriptSeenForCurrentResponse = false;
+        await speakEleven(text);
+      }
       return;
     }
+
+    // IMPORTANT: We intentionally do NOT forward OpenAI audio to Twilio anymore.
+    // So we ignore response.audio.delta completely.
 
     if (evt.type === 'error') {
       console.error('❌ OpenAI error:', JSON.stringify(evt.error));
