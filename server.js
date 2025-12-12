@@ -200,8 +200,47 @@ wss.on('connection', (twilioWs) => {
   let textBuf = '';
   let textSeen = false;
 
-  // speaking lock (no interrupt yet)
+  // speaking lock
   let speaking = false;
+
+  // --- NEW: hangup state ---
+  let farewellPending = false;
+  let hangupTimer = null;
+  let lastUserSpeechAt = 0;
+
+  function clearHangupTimer() {
+    if (hangupTimer) {
+      clearTimeout(hangupTimer);
+      hangupTimer = null;
+    }
+  }
+
+  // Heuristic: only arm hangup if Tessa explicitly closes.
+  function isFarewellText(t) {
+    const s = (t || '').toLowerCase();
+    return (
+      s.includes('tot ziens') ||
+      s.includes('fijne dag') ||
+      s.includes('fijne dag verder') ||
+      s.includes('bedankt voor uw tijd') ||
+      s.includes('ik wens u') ||
+      s.includes('dag hoor') ||
+      s.includes('doei') ||
+      s.includes('goodbye') ||
+      s.includes('have a nice day')
+    );
+  }
+
+  function armHangupAfterSilence(ms) {
+    clearHangupTimer();
+    hangupTimer = setTimeout(() => {
+      const sinceSpeech = Date.now() - lastUserSpeechAt;
+      if (farewellPending && sinceSpeech >= ms) {
+        console.log(`[${new Date().toISOString()}] 📵 Hanging up after farewell + ${ms}ms silence`);
+        try { twilioWs.close(); } catch (_) {}
+      }
+    }, ms);
+  }
 
   function sendUlawFrame(frame) {
     if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
@@ -229,6 +268,13 @@ wss.on('connection', (twilioWs) => {
     const t = (text || '').trim();
     if (!t) return;
     if (speaking) return;
+
+    // --- NEW: hangup detection on what we are about to speak ---
+    if (isFarewellText(t)) {
+      farewellPending = true;
+      // we arm after we finish speaking (see finally)
+    }
+
     speaking = true;
     try {
       await elevenTTSStreamToUlaw(t, pushAndSendUlaw);
@@ -236,6 +282,10 @@ wss.on('connection', (twilioWs) => {
       console.error('❌ Eleven streaming failed:', e.message);
     } finally {
       speaking = false;
+      // --- NEW: if we spoke farewell, hang up after 3s silence ---
+      if (farewellPending) {
+        armHangupAfterSilence(3000);
+      }
     }
   }
 
@@ -255,13 +305,11 @@ wss.on('connection', (twilioWs) => {
   }
 
   openaiWs.on('open', () => {
-    // ✅ CHANGE: text-only session
     safeOpenAISend({
       type: 'session.update',
       session: {
         modalities: ['text'],
         instructions: INSTRUCTIONS,
-        // keep transcription enabled (audio in -> text out)
         input_audio_format: 'g711_ulaw',
         input_audio_transcription: { model: 'whisper-1' },
         turn_detection: {
@@ -277,7 +325,6 @@ wss.on('connection', (twilioWs) => {
       }
     });
 
-    // Opening: we’ll speak via Eleven
     safeOpenAISend({
       type: 'response.create',
       response: {
@@ -310,6 +357,7 @@ wss.on('connection', (twilioWs) => {
 
     if (data.event === 'stop') {
       console.log(`[${new Date().toISOString()}] Twilio stop streamSid=${streamSid}`);
+      clearHangupTimer();
       if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
     }
   });
@@ -317,22 +365,29 @@ wss.on('connection', (twilioWs) => {
   openaiWs.on('message', async (raw) => {
     const evt = JSON.parse(raw);
 
-    // reset per response
+    // --- NEW: cancel hangup if caller starts talking again ---
+    if (evt.type === 'input_audio_buffer.speech_started') {
+      lastUserSpeechAt = Date.now();
+      if (farewellPending) {
+        console.log(`[${new Date().toISOString()}] 🛑 User spoke again, cancel hangup`);
+      }
+      farewellPending = false;
+      clearHangupTimer();
+      return;
+    }
+
     if (evt.type === 'response.created' || evt.type === 'response.output_item.added') {
       textBuf = '';
       textSeen = false;
       return;
     }
 
-    // ✅ Collect assistant text from multiple possible event names
-    // Some builds send response.text.delta, others response.output_text.delta
     if ((evt.type === 'response.text.delta' || evt.type === 'response.output_text.delta') && typeof evt.delta === 'string') {
       textSeen = true;
       textBuf += evt.delta;
       return;
     }
 
-    // done events variants
     if (evt.type === 'response.text.done' || evt.type === 'response.output_text.done') {
       if (textSeen) {
         const text = textBuf.trim();
@@ -360,11 +415,13 @@ wss.on('connection', (twilioWs) => {
 
   openaiWs.on('close', (code) => {
     console.log(`[${new Date().toISOString()}] OpenAI WS closed code=${code}`);
+    clearHangupTimer();
     if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
   });
 
   openaiWs.on('error', (e) => {
     console.error('❌ OpenAI WS error:', e.message);
+    clearHangupTimer();
     if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
   });
 });
