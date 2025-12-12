@@ -19,11 +19,6 @@ const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_multilingual_v2';
 
-if (!OPENAI_API_KEY) {
-  console.error('❌ OPENAI_API_KEY missing');
-  process.exit(1);
-}
-
 /* =======================
    TWILIO
 ======================= */
@@ -32,13 +27,24 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_FROM = process.env.TWILIO_FROM;
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
 
-const twilioClient =
-  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
+const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 /* =======================
-   ELEVENLABS
+   PHONE NORMALIZATION (NL)
 ======================= */
-async function elevenTTSStreamToUlaw(text, pushUlaw) {
+function normalizePhone(raw) {
+  if (!raw) return null;
+  const s = raw.replace(/\D/g, '');
+  if (s.startsWith('31') && s.length === 11) return `+${s}`;
+  if (s.startsWith('06') && s.length === 10) return `+31${s.slice(1)}`;
+  if (s.startsWith('6') && s.length === 9) return `+316${s.slice(1)}`;
+  return null;
+}
+
+/* =======================
+   ELEVENLABS → μLAW
+======================= */
+async function elevenSpeak(text, onUlaw) {
   const ff = spawn('ffmpeg', [
     '-hide_banner',
     '-loglevel', 'error',
@@ -49,7 +55,7 @@ async function elevenTTSStreamToUlaw(text, pushUlaw) {
     'pipe:1'
   ]);
 
-  ff.stdout.on('data', pushUlaw);
+  ff.stdout.on('data', onUlaw);
 
   const res = await fetch(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream`,
@@ -60,7 +66,10 @@ async function elevenTTSStreamToUlaw(text, pushUlaw) {
         'Content-Type': 'application/json',
         Accept: 'audio/mpeg'
       },
-      body: JSON.stringify({ model_id: ELEVEN_MODEL, text })
+      body: JSON.stringify({
+        model_id: ELEVEN_MODEL,
+        text
+      })
     }
   );
 
@@ -77,7 +86,7 @@ const httpServer = http.createServer(async (req, res) => {
   if (req.url === '/twiml' && req.method === 'POST') {
     const wsUrl = `wss://${req.headers.host}`;
     res.writeHead(200, { 'Content-Type': 'text/xml' });
-    res.end(`
+    res.end(`<?xml version="1.0"?>
 <Response>
   <Connect>
     <Stream url="${wsUrl}" />
@@ -87,17 +96,36 @@ const httpServer = http.createServer(async (req, res) => {
   }
 
   if (req.url.startsWith('/call-test')) {
-    const phone = new URL(req.url, `http://${req.headers.host}`).searchParams.get('phone');
-    const call = await twilioClient.calls.create({
-      to: phone,
-      from: TWILIO_FROM,
-      url: `${PUBLIC_BASE_URL}/twiml`
-    });
-    res.end(JSON.stringify({ ok: true, sid: call.sid }));
-    return;
+    try {
+      const url = new URL(req.url, `http://${req.headers.host}`);
+      const raw = url.searchParams.get('phone');
+      const phone = normalizePhone(raw);
+
+      if (!phone) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Invalid phone number' }));
+        return;
+      }
+
+      const call = await twilioClient.calls.create({
+        to: phone,
+        from: TWILIO_FROM,
+        url: `${PUBLIC_BASE_URL}/twiml`
+      });
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, to: phone, sid: call.sid }));
+      return;
+    } catch (e) {
+      console.error('❌ call-test error', e.message);
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+      return;
+    }
   }
 
-  res.writeHead(404).end();
+  res.writeHead(404);
+  res.end();
 });
 
 /* =======================
@@ -109,9 +137,10 @@ wss.on('connection', (twilioWs) => {
   let streamSid;
   let speaking = false;
   let hasUserSpoken = false;
-  let textBuf = '';
+  let textBuf = Buffer.from('');
 
   function sendUlaw(frame) {
+    if (twilioWs.readyState !== WebSocket.OPEN) return;
     twilioWs.send(JSON.stringify({
       event: 'media',
       streamSid,
@@ -122,7 +151,7 @@ wss.on('connection', (twilioWs) => {
   async function speak(text) {
     if (speaking) return;
     speaking = true;
-    await elevenTTSStreamToUlaw(text, sendUlaw);
+    await elevenSpeak(text, sendUlaw);
     speaking = false;
   }
 
@@ -174,23 +203,23 @@ wss.on('connection', (twilioWs) => {
   openaiWs.on('message', async (raw) => {
     const evt = JSON.parse(raw);
 
-    if (evt.type === 'input_audio_buffer.speech_stopped') {
-      if (!hasUserSpoken) {
-        hasUserSpoken = true;
-        openaiWs.send(JSON.stringify({
-          type: 'response.create',
-          response: { modalities: ['text'] }
-        }));
-      }
+    if (evt.type === 'input_audio_buffer.speech_stopped' && !hasUserSpoken) {
+      hasUserSpoken = true;
+      openaiWs.send(JSON.stringify({
+        type: 'response.create',
+        response: { modalities: ['text'] }
+      }));
+      return;
     }
 
     if (evt.type === 'response.text.delta') {
-      textBuf += evt.delta;
+      textBuf = Buffer.concat([textBuf, Buffer.from(evt.delta)]);
     }
 
     if (evt.type === 'response.text.done') {
-      await speak(textBuf);
-      textBuf = '';
+      const text = textBuf.toString().trim();
+      textBuf = Buffer.alloc(0);
+      if (text) await speak(text);
     }
   });
 });
