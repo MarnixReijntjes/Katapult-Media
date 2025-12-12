@@ -216,12 +216,11 @@ wss.on('connection', (twilioWs) => {
     pumpSpeakQueue();
   }
 
-  // MINI-STEP: early speak chunk extraction
+  // Early speak chunk extraction
   function extractSpeakableChunkFromBuffer() {
     const s = textBuf;
     if (!s) return null;
 
-    // 1) Prefer sentence boundary
     const candidates = ['.', '?', '!', '\n'];
     let last = -1;
     for (const c of candidates) {
@@ -229,14 +228,12 @@ wss.on('connection', (twilioWs) => {
       if (i > last) last = i;
     }
 
-    // speak only if boundary is far enough to avoid tiny fragments
     if (last >= 40) {
       const chunk = s.slice(0, last + 1).trim();
       textBuf = s.slice(last + 1);
       return chunk;
     }
 
-    // 2) Fallback: buffer too long -> cut at word boundary
     if (s.length >= 140) {
       const cut = s.lastIndexOf(' ', 140);
       if (cut >= 60) {
@@ -281,7 +278,8 @@ wss.on('connection', (twilioWs) => {
         input_audio_transcription: { model: 'whisper-1' },
         turn_detection: {
           type: 'server_vad',
-          silence_duration_ms: 500,
+          // MINI-STAP: 500 -> 200 (sneller turn detect)
+          silence_duration_ms: 200,
           create_response: true
         },
         temperature: 0.7,
@@ -289,7 +287,6 @@ wss.on('connection', (twilioWs) => {
       }
     });
 
-    // flush buffered audio
     while (pendingAudio.length) {
       const payload = pendingAudio.shift();
       safeOpenAISend({ type: 'input_audio_buffer.append', audio: payload });
@@ -345,32 +342,27 @@ wss.on('connection', (twilioWs) => {
     try {
       const evt = JSON.parse(raw);
 
-      // you speak first: create response only after first speech_stopped
+      // You speak first: create response only after first speech_stopped
       if (evt.type === 'input_audio_buffer.speech_stopped' && !hasUserSpoken) {
         hasUserSpoken = true;
         safeOpenAISend({ type: 'response.create', response: { modalities: ['text'] } });
         return;
       }
 
-      // accept both delta names
       if (
         (evt.type === 'response.text.delta' || evt.type === 'response.output_text.delta') &&
         typeof evt.delta === 'string'
       ) {
         textBuf += evt.delta;
 
-        // MINI-STEP: speak early if we have a chunk
-        // Only start chunking if we're not already backed up badly
         let chunk;
         while ((chunk = extractSpeakableChunkFromBuffer())) {
           enqueueSpeak(chunk);
-          // speak only one chunk per delta burst if queue is building up
           if (speakQueue.length >= 2) break;
         }
         return;
       }
 
-      // accept both done names
       if (evt.type === 'response.text.done' || evt.type === 'response.output_text.done') {
         const rest = (textBuf || '').trim();
         textBuf = '';
