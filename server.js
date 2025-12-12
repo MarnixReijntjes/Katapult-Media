@@ -159,6 +159,9 @@ wss.on('connection', (twilioWs) => {
   let streamSid = null;
   let greetingPlayed = false;
 
+  // MINI-STEP: speel 1 vaste ElevenLabs zin af bij start (hoorbaar bewijs)
+  let elevenStartTestPlayed = false;
+
   const openaiWs = new WebSocket(
     'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
     {
@@ -191,40 +194,74 @@ wss.on('connection', (twilioWs) => {
     }
   }
 
-  openaiWs.on('open', () => {
-    openaiWs.send(
-      JSON.stringify({
-        type: 'session.update',
-        session: {
-          modalities: ['audio', 'text'],
-          instructions: INSTRUCTIONS,
-          voice: VOICE,
-          input_audio_format: 'g711_ulaw',
-          output_audio_format: 'g711_ulaw',
-          input_audio_transcription: { model: 'whisper-1' },
-          turn_detection: { type: 'server_vad', create_response: true },
-          speed: SPEED
-        }
-      })
-    );
-
-    // OPENING: TEXT ONLY (we will play it via ElevenLabs)
-    openaiWs.send(
-      JSON.stringify({
-        type: 'response.create',
-        response: {
-          modalities: ['text'],
-          instructions: 'Zeg exact de openingszin zoals beschreven, geen extra woorden.'
-        }
-      })
-    );
-  });
-
-  // === MINI FIX: guard openaiWs.send while CONNECTING ===
+  // Guard send to OpenAI (CONNECTING fix)
   function safeOpenAISend(obj) {
     if (openaiWs.readyState !== WebSocket.OPEN) return;
     openaiWs.send(JSON.stringify(obj));
   }
+
+  async function playElevenLabsOnce(text) {
+    try {
+      const mp3 = await elevenTTS(text);
+
+      const proc = spawn('ffmpeg', [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-i',
+        'pipe:0',
+        '-ar',
+        '8000',
+        '-ac',
+        '1',
+        '-f',
+        'mulaw',
+        'pipe:1'
+      ]);
+
+      proc.on('error', (e) => {
+        console.error('❌ ffmpeg spawn error:', e.message);
+      });
+
+      proc.stdout.on('data', (chunk) => {
+        pushAndSendUlaw(chunk);
+      });
+
+      proc.stderr.on('data', (d) => {
+        console.error('❌ ffmpeg stderr:', d.toString());
+      });
+
+      proc.stdin.write(mp3);
+      proc.stdin.end();
+    } catch (e) {
+      console.error('❌ ElevenLabs start test failed:', e.message);
+    }
+  }
+
+  openaiWs.on('open', () => {
+    safeOpenAISend({
+      type: 'session.update',
+      session: {
+        modalities: ['audio', 'text'],
+        instructions: INSTRUCTIONS,
+        voice: VOICE,
+        input_audio_format: 'g711_ulaw',
+        output_audio_format: 'g711_ulaw',
+        input_audio_transcription: { model: 'whisper-1' },
+        turn_detection: { type: 'server_vad', create_response: true },
+        speed: SPEED
+      }
+    });
+
+    // (blijft zoals het was)
+    safeOpenAISend({
+      type: 'response.create',
+      response: {
+        modalities: ['text'],
+        instructions: 'Zeg exact de openingszin zoals beschreven, geen extra woorden.'
+      }
+    });
+  });
 
   twilioWs.on('message', (msg) => {
     const data = JSON.parse(msg);
@@ -232,6 +269,15 @@ wss.on('connection', (twilioWs) => {
     if (data.event === 'start') {
       streamSid = data.start.streamSid;
       console.log(`[${new Date().toISOString()}] Twilio start streamSid=${streamSid}`);
+
+      // ====== ENIGE NIEUWE LOGICA VAN DEZE STAP ======
+      if (!elevenStartTestPlayed) {
+        elevenStartTestPlayed = true;
+        // hoorbaar bewijs
+        playElevenLabsOnce('Test. Dit is de nieuwe ElevenLabs stem.');
+      }
+      // ==============================================
+
       return;
     }
 
@@ -251,12 +297,14 @@ wss.on('connection', (twilioWs) => {
   openaiWs.on('message', async (raw) => {
     const evt = JSON.parse(raw);
 
+    // bestaande opening-branch blijft staan (maar jij hoeft logs niet te zien)
     if (evt.type === 'response.output_text.done' && !greetingPlayed) {
       greetingPlayed = true;
 
       const text = (evt.text || '').trim();
-      console.log(`[${new Date().toISOString()}] Opening text from OpenAI (for ElevenLabs): "${text.slice(0, 120)}"`);
-
+      // we laten dit staan, maar het is niet de “bewijs stap”
+      // (bewijs is nu de vaste zin bij start)
+      // play via ElevenLabs:
       try {
         const mp3 = await elevenTTS(text);
 
@@ -275,22 +323,12 @@ wss.on('connection', (twilioWs) => {
           'pipe:1'
         ]);
 
-        proc.on('error', (e) => {
-          console.error('❌ ffmpeg spawn error:', e.message);
-        });
-
-        proc.stdout.on('data', (chunk) => {
-          pushAndSendUlaw(chunk);
-        });
-
-        proc.stderr.on('data', (d) => {
-          console.error('❌ ffmpeg stderr:', d.toString());
-        });
+        proc.stdout.on('data', (chunk) => pushAndSendUlaw(chunk));
+        proc.stderr.on('data', (d) => console.error('❌ ffmpeg stderr:', d.toString()));
+        proc.on('error', (e) => console.error('❌ ffmpeg spawn error:', e.message));
 
         proc.stdin.write(mp3);
         proc.stdin.end();
-
-        console.log(`[${new Date().toISOString()}] ✅ Played ElevenLabs opening (mp3 bytes=${mp3.length})`);
       } catch (e) {
         console.error('❌ ElevenLabs opening failed:', e.message);
       }
@@ -298,6 +336,7 @@ wss.on('connection', (twilioWs) => {
       return;
     }
 
+    // Rest: OpenAI audio
     if (evt.type === 'response.audio.delta' && evt.delta) {
       pushAndSendUlaw(Buffer.from(evt.delta, 'base64'));
     }
@@ -324,3 +363,4 @@ wss.on('connection', (twilioWs) => {
 httpServer.listen(PORT, () => {
   console.log(`✅ Server live on ${PORT}`);
 });
+
