@@ -42,7 +42,6 @@ function normalizePhone(raw) {
 
   const cleaned = raw.toString().trim();
 
-  // +... allowed
   if (cleaned.startsWith('+')) {
     const digits = cleaned.slice(1).replace(/\D/g, '');
     if (!digits) return null;
@@ -164,13 +163,16 @@ wss.on('connection', (twilioWs) => {
 
   // OPENAI WS readiness + small audio buffer until OPEN
   let openaiReady = false;
-  const pendingAudio = []; // array of base64 payload strings
-  const MAX_PENDING = 50;  // ~1s-ish depending on frame size
+  const pendingAudio = []; // base64 payload strings
+  const MAX_PENDING = 50;  // ~1s-ish
 
-  let speaking = false;
   let hasUserSpoken = false;
 
-  // text aggregation
+  // TTS queue (prevents overlap)
+  let speaking = false;
+  const speakQueue = [];
+
+  // assistant text buffer
   let textBuf = '';
 
   function safeTwilioSend(obj) {
@@ -182,7 +184,6 @@ wss.on('connection', (twilioWs) => {
 
   function onUlawChunk(chunk) {
     if (!streamSid) return;
-    // chunk may be >160; split to 20ms frames
     let buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     while (buf.length >= 160) {
       const frame = buf.subarray(0, 160);
@@ -195,18 +196,57 @@ wss.on('connection', (twilioWs) => {
     }
   }
 
-  async function speak(text) {
+  function pumpSpeakQueue() {
+    if (speaking) return;
+    const next = speakQueue.shift();
+    if (!next) return;
+    speaking = true;
+    elevenSpeak(next, onUlawChunk)
+      .catch((e) => console.error('❌ Eleven error:', e.message))
+      .finally(() => {
+        speaking = false;
+        pumpSpeakQueue();
+      });
+  }
+
+  function enqueueSpeak(text) {
     const t = (text || '').trim();
     if (!t) return;
-    if (speaking) return;
-    speaking = true;
-    try {
-      await elevenSpeak(t, onUlawChunk);
-    } catch (e) {
-      console.error('❌ Eleven error:', e.message);
-    } finally {
-      speaking = false;
+    speakQueue.push(t);
+    pumpSpeakQueue();
+  }
+
+  // MINI-STEP: early speak chunk extraction
+  function extractSpeakableChunkFromBuffer() {
+    const s = textBuf;
+    if (!s) return null;
+
+    // 1) Prefer sentence boundary
+    const candidates = ['.', '?', '!', '\n'];
+    let last = -1;
+    for (const c of candidates) {
+      const i = s.lastIndexOf(c);
+      if (i > last) last = i;
     }
+
+    // speak only if boundary is far enough to avoid tiny fragments
+    if (last >= 40) {
+      const chunk = s.slice(0, last + 1).trim();
+      textBuf = s.slice(last + 1);
+      return chunk;
+    }
+
+    // 2) Fallback: buffer too long -> cut at word boundary
+    if (s.length >= 140) {
+      const cut = s.lastIndexOf(' ', 140);
+      if (cut >= 60) {
+        const chunk = s.slice(0, cut).trim();
+        textBuf = s.slice(cut + 1);
+        return chunk;
+      }
+    }
+
+    return null;
   }
 
   const openaiWs = new WebSocket(
@@ -281,10 +321,9 @@ wss.on('connection', (twilioWs) => {
         const payload = data.media?.payload;
         if (!payload) return;
 
-        // buffer until OpenAI ready; DO NOT crash
         if (!openaiReady || openaiWs.readyState !== WebSocket.OPEN) {
           pendingAudio.push(payload);
-          if (pendingAudio.length > MAX_PENDING) pendingAudio.shift(); // drop oldest
+          if (pendingAudio.length > MAX_PENDING) pendingAudio.shift();
           return;
         }
 
@@ -319,14 +358,23 @@ wss.on('connection', (twilioWs) => {
         typeof evt.delta === 'string'
       ) {
         textBuf += evt.delta;
+
+        // MINI-STEP: speak early if we have a chunk
+        // Only start chunking if we're not already backed up badly
+        let chunk;
+        while ((chunk = extractSpeakableChunkFromBuffer())) {
+          enqueueSpeak(chunk);
+          // speak only one chunk per delta burst if queue is building up
+          if (speakQueue.length >= 2) break;
+        }
         return;
       }
 
       // accept both done names
       if (evt.type === 'response.text.done' || evt.type === 'response.output_text.done') {
-        const text = (textBuf || '').trim();
+        const rest = (textBuf || '').trim();
         textBuf = '';
-        if (text) await speak(text);
+        if (rest) enqueueSpeak(rest);
         return;
       }
 
