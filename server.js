@@ -15,9 +15,17 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SPEED = parseFloat(process.env.SPEED || '1.0');
 
 const INSTRUCTIONS_OUTBOUND = process.env.INSTRUCTIONS_OUTBOUND || process.env.INSTRUCTIONS || '';
-const OUTBOUND_OPENING =
-  process.env.OUTBOUND_OPENING ||
-  'Hoi, met Tessa van Move2Go Solutions.';
+const OUTBOUND_OPENING = process.env.OUTBOUND_OPENING || 'Hoi, met Tessa van Move2Go Solutions.';
+const OUTBOUND_OPENING_DELAY_MS = parseInt(process.env.OUTBOUND_OPENING_DELAY_MS || '700', 10);
+
+// IMPORTANT: outbound guard to prevent double intro
+const OUTBOUND_GUARD = `
+BELANGRIJK (OUTBOUND):
+- Je hebt je al voorgesteld via een vooraf afgespeelde openingszin.
+- Herhaal NIET je naam, bedrijf, begroeting ("hoi", "goedemiddag") of openingszin.
+- Begin direct met de inhoudelijke eerste vraag, zonder extra introductie.
+- Zeg geen "met Tessa" / "ik bel namens" / "goedemiddag" / "hoe kan ik helpen" als opening.
+`;
 
 const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
@@ -45,7 +53,6 @@ const twilioClient =
 const TRELLO_KEY = process.env.TRELLO_KEY;
 const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
 const TRELLO_LIST_ID = process.env.TRELLO_LIST_ID;
-
 const TRELLO_ENABLED = !!(TRELLO_KEY && TRELLO_TOKEN && TRELLO_LIST_ID);
 
 /* =======================
@@ -81,8 +88,9 @@ function extractPhoneFromText(text) {
 /* =======================
    ELEVENLABS → μLAW (stream)
 ======================= */
-async function elevenSpeak(text, onUlaw) {
+async function elevenSpeakAbortable(text, onUlaw, signal) {
   if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) throw new Error('ELEVEN_NOT_CONFIGURED');
+  if (signal?.aborted) throw new Error('ABORTED');
 
   const ff = spawn('ffmpeg', [
     '-hide_banner',
@@ -99,9 +107,20 @@ async function elevenSpeak(text, onUlaw) {
     'pipe:1'
   ]);
 
+  const killAll = () => {
+    try { ff.stdin.end(); } catch {}
+    try { ff.kill('SIGKILL'); } catch {}
+  };
+
+  if (signal) {
+    signal.addEventListener('abort', () => killAll(), { once: true });
+  }
+
   ff.stdout.on('data', onUlaw);
 
-  const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream`, {
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream?optimize_streaming_latency=4`;
+
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
       'xi-api-key': ELEVEN_API_KEY,
@@ -111,19 +130,38 @@ async function elevenSpeak(text, onUlaw) {
     body: JSON.stringify({
       model_id: ELEVEN_MODEL,
       text
-    })
+    }),
+    signal
   });
 
   if (!res.ok) {
     const err = await res.text().catch(() => '');
-    try { ff.stdin.end(); } catch {}
+    killAll();
     throw new Error(`ELEVEN_STREAM_FAILED ${res.status}: ${err}`);
   }
 
   const { Readable } = await import('stream');
-  Readable.fromWeb(res.body).pipe(ff.stdin);
+  const src = Readable.fromWeb(res.body);
 
-  await new Promise((r) => ff.on('close', r));
+  if (signal) {
+    signal.addEventListener(
+      'abort',
+      () => {
+        try { src.destroy(); } catch {}
+        killAll();
+      },
+      { once: true }
+    );
+  }
+
+  src.pipe(ff.stdin);
+
+  await new Promise((r) => {
+    ff.on('close', r);
+    ff.on('error', r);
+  });
+
+  if (signal?.aborted) throw new Error('ABORTED');
 }
 
 /* =======================
@@ -171,16 +209,10 @@ async function pollTrelloLeads() {
       if (hasCalled) continue;
 
       const rawPhone = extractPhoneFromText(card.desc || '');
-      if (!rawPhone) {
-        console.log(`Trello skip card=${card.id} (no phone in desc)`);
-        continue;
-      }
+      if (!rawPhone) continue;
 
       const phone = normalizePhone(rawPhone);
-      if (!phone) {
-        console.log(`Trello skip card=${card.id} (bad phone raw=${rawPhone})`);
-        continue;
-      }
+      if (!phone) continue;
 
       console.log(`Trello calling card=${card.id} phone=${phone} raw=${rawPhone}`);
 
@@ -191,7 +223,6 @@ async function pollTrelloLeads() {
         continue;
       }
 
-      // Add "GEBELD" label
       const labelUrl = `https://api.trello.com/1/cards/${card.id}/labels?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
       const labelRes = await fetch(labelUrl, {
         method: 'POST',
@@ -230,7 +261,6 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // IMPORTANT: Twilio often calls /twiml?CallSid=...
   if (req.url && req.url.startsWith('/twiml') && (req.method === 'POST' || req.method === 'GET')) {
     console.log(`[${new Date().toISOString()}] TwiML hit method=${req.method} url=${req.url}`);
     const wsUrl = `wss://${req.headers.host}`;
@@ -281,31 +311,35 @@ const wss = new WebSocketServer({ server: httpServer });
 
 wss.on('connection', (twilioWs) => {
   let streamSid = null;
-
-  // Outbound-only focus: greet once immediately after start
   let greeted = false;
 
-  // TTS queue (avoid overlap)
+  let callActive = true;
+  let currentAbort = null;
+
+  // TTS queue
   let speaking = false;
   const speakQueue = [];
 
-  // transcript aggregation from OpenAI
+  // OpenAI transcript aggregation
   let transcriptBuf = '';
   let transcriptSeen = false;
 
   function safeTwilioSend(obj) {
+    if (!callActive) return;
     if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
     try { twilioWs.send(JSON.stringify(obj)); } catch {}
   }
 
-  // μ-law framing (20ms = 160 bytes @ 8kHz)
   let ulawBuffer = Buffer.alloc(0);
   function pushAndSendUlaw(chunk) {
+    if (!callActive) return;
     ulawBuffer = Buffer.concat([ulawBuffer, chunk]);
     const frameSize = 160;
+
     while (ulawBuffer.length >= frameSize) {
       const frame = ulawBuffer.subarray(0, frameSize);
       ulawBuffer = ulawBuffer.subarray(frameSize);
+
       safeTwilioSend({
         event: 'media',
         streamSid,
@@ -314,29 +348,50 @@ wss.on('connection', (twilioWs) => {
     }
   }
 
-  function pumpSpeakQueue() {
+  function cancelAllSpeech(reason) {
+    callActive = false;
+    speakQueue.length = 0;
+    if (currentAbort) {
+      try { currentAbort.abort(); } catch {}
+      currentAbort = null;
+    }
+    console.log(`[${new Date().toISOString()}] Speech cancelled reason=${reason}`);
+  }
+
+  async function pumpSpeakQueue() {
     if (speaking) return;
+    if (!callActive) return;
+    if (twilioWs.readyState !== WebSocket.OPEN) return;
+
     const next = speakQueue.shift();
     if (!next) return;
 
     speaking = true;
+    currentAbort = new AbortController();
     const started = Date.now();
+    console.log(`[${new Date().toISOString()}] SPEAK_START text="${next.slice(0, 80)}"`);
 
-    elevenSpeak(next, pushAndSendUlaw)
-      .then(() => {
-        const ms = Date.now() - started;
-        console.log(`[${new Date().toISOString()}] Eleven spoke ms=${ms} text="${next.slice(0, 80)}"`);
-      })
-      .catch((e) => console.error(`Eleven error: ${e.message}`))
-      .finally(() => {
-        speaking = false;
-        pumpSpeakQueue();
-      });
+    try {
+      await elevenSpeakAbortable(next, pushAndSendUlaw, currentAbort.signal);
+      const ms = Date.now() - started;
+      console.log(`[${new Date().toISOString()}] Eleven finished ms=${ms} text="${next.slice(0, 80)}"`);
+    } catch (e) {
+      if (String(e.message).includes('ABORTED') || currentAbort?.signal?.aborted) {
+        console.log(`[${new Date().toISOString()}] Eleven aborted`);
+      } else {
+        console.error(`Eleven error: ${e.message}`);
+      }
+    } finally {
+      speaking = false;
+      currentAbort = null;
+      if (callActive) pumpSpeakQueue();
+    }
   }
 
   function enqueueSpeak(text) {
     const t = (text || '').trim();
     if (!t) return;
+    if (!callActive) return;
     speakQueue.push(t);
     pumpSpeakQueue();
   }
@@ -355,11 +410,13 @@ wss.on('connection', (twilioWs) => {
   }
 
   openaiWs.on('open', () => {
+    const INSTRUCTIONS_EFFECTIVE = `${OUTBOUND_GUARD}\n\n${INSTRUCTIONS_OUTBOUND}`.trim();
+
     safeOpenAISend({
       type: 'session.update',
       session: {
         modalities: ['audio', 'text'],
-        instructions: INSTRUCTIONS_OUTBOUND,
+        instructions: INSTRUCTIONS_EFFECTIVE,
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         input_audio_transcription: { model: 'whisper-1' },
@@ -375,43 +432,47 @@ wss.on('connection', (twilioWs) => {
         speed: SPEED
       }
     });
+
+    console.log(`[${new Date().toISOString()}] OpenAI session.update sent (OUTBOUND_GUARD enabled)`);
   });
 
-  // Twilio → OpenAI
   twilioWs.on('message', (msg) => {
     let data;
     try { data = JSON.parse(msg); } catch { return; }
 
     if (data.event === 'start') {
       streamSid = data.start.streamSid;
-      console.log(`[${new Date().toISOString()}] Twilio start streamSid=${streamSid} direction=${data.start.direction || 'unknown'}`);
+      console.log(`[${new Date().toISOString()}] Twilio start streamSid=${streamSid}`);
 
-      // Fast first reaction: speak fixed opening immediately (Eleven), once per call.
       if (!greeted) {
-  greeted = true;
-  setTimeout(() => {
-    enqueueSpeak(OUTBOUND_OPENING);
-  }, 700); // ms
-}
+        greeted = true;
+        setTimeout(() => {
+          if (!callActive) return;
+          if (twilioWs.readyState !== WebSocket.OPEN) return;
+          enqueueSpeak(OUTBOUND_OPENING);
+        }, OUTBOUND_OPENING_DELAY_MS);
+      }
       return;
     }
 
     if (data.event === 'media') {
+      if (!callActive) return;
       safeOpenAISend({ type: 'input_audio_buffer.append', audio: data.media.payload });
       return;
     }
 
     if (data.event === 'stop') {
       console.log(`[${new Date().toISOString()}] Twilio stop streamSid=${streamSid}`);
+      cancelAllSpeech('twilio_stop');
       try { if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); } catch {}
       return;
     }
   });
 
-  // OpenAI → transcript → Eleven
   openaiWs.on('message', async (raw) => {
     let evt;
     try { evt = JSON.parse(raw); } catch { return; }
+    if (!callActive) return;
 
     if (evt.type === 'response.created' || evt.type === 'response.output_item.added') {
       transcriptBuf = '';
@@ -450,9 +511,8 @@ wss.on('connection', (twilioWs) => {
     try { if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close(); } catch {}
   });
 
-  twilioWs.on('close', () => {
-    try { if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); } catch {}
-  });
+  twilioWs.on('close', () => cancelAllSpeech('twilio_ws_close'));
+  twilioWs.on('error', () => cancelAllSpeech('twilio_ws_error'));
 });
 
 /* =======================
@@ -461,4 +521,3 @@ wss.on('connection', (twilioWs) => {
 httpServer.listen(PORT, () => {
   console.log(`Server live on ${PORT}`);
 });
-
