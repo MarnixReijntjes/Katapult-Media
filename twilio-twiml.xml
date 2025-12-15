@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Connect>
-        <Stream url="wss://nodejs-relay-server-for-inbound-voice.onrender.com" />
-    </Connect>
-</Response>
