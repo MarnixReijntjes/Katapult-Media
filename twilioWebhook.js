@@ -61,6 +61,7 @@ app.post("/handle-speech", async (req, res) => {
     console.log("USER SAID:", userText);
 
     if (!userText) {
+      // Vraag opnieuw als er niets gezegd wordt
       const retry = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say language="nl-NL" voice="Polly.Lotte">
@@ -77,6 +78,7 @@ app.post("/handle-speech", async (req, res) => {
       userText
     });
 
+    // Geen terugbelverzoek, maar doorgaan met de vraag/antwoord
     return res.type("text/xml").send(
       listenAgainTwiml(reply)
     );
