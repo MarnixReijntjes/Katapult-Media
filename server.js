@@ -1,5 +1,4 @@
-const { buildSystemPrompt } = require("./promptBuilder");
+const { app } = require("./twilioWebhook");
 
-const prompt = buildSystemPrompt("des");
-console.log("=== SYSTEM PROMPT ===");
-console.log(prompt);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Listening on", PORT));
