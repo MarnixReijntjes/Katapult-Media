@@ -18,9 +18,10 @@ const INSTRUCTIONS_OUTBOUND = process.env.INSTRUCTIONS_OUTBOUND || process.env.I
 const OUTBOUND_OPENING = process.env.OUTBOUND_OPENING || 'Hoi, met Tessa van Move2Go Solutions.';
 const OUTBOUND_OPENING_DELAY_MS = parseInt(process.env.OUTBOUND_OPENING_DELAY_MS || '700', 10);
 
-// IMPORTANT: outbound guard to prevent double intro
+// Outbound guard: prevent OpenAI from re-introducing
 const OUTBOUND_GUARD = `
 BELANGRIJK (OUTBOUND):
+- Dit is OUTBOUND: jij belt de klant. Zeg NOOIT "leuk dat u belt".
 - Je hebt je al voorgesteld via een vooraf afgespeelde openingszin.
 - Herhaal NIET je naam, bedrijf, begroeting ("hoi", "goedemiddag") of openingszin.
 - Begin direct met de inhoudelijke eerste vraag, zonder extra introductie.
@@ -48,14 +49,6 @@ const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
 
 /* =======================
-   TRELLO
-======================= */
-const TRELLO_KEY = process.env.TRELLO_KEY;
-const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
-const TRELLO_LIST_ID = process.env.TRELLO_LIST_ID;
-const TRELLO_ENABLED = !!(TRELLO_KEY && TRELLO_TOKEN && TRELLO_LIST_ID);
-
-/* =======================
    PHONE NORMALIZATION (NL)
 ======================= */
 function normalizePhone(raw) {
@@ -77,12 +70,6 @@ function normalizePhone(raw) {
   if (s.startsWith('6') && s.length === 9) return `+316${s.slice(1)}`;
 
   return null;
-}
-
-function extractPhoneFromText(text) {
-  const t = text || '';
-  const m = t.match(/(\+?[0-9][0-9()\-\s]{7,20})/);
-  return m ? m[0].trim() : null;
 }
 
 /* =======================
@@ -112,10 +99,7 @@ async function elevenSpeakAbortable(text, onUlaw, signal) {
     try { ff.kill('SIGKILL'); } catch {}
   };
 
-  if (signal) {
-    signal.addEventListener('abort', () => killAll(), { once: true });
-  }
-
+  if (signal) signal.addEventListener('abort', () => killAll(), { once: true });
   ff.stdout.on('data', onUlaw);
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream?optimize_streaming_latency=4`;
@@ -127,10 +111,7 @@ async function elevenSpeakAbortable(text, onUlaw, signal) {
       'Content-Type': 'application/json',
       Accept: 'audio/mpeg'
     },
-    body: JSON.stringify({
-      model_id: ELEVEN_MODEL,
-      text
-    }),
+    body: JSON.stringify({ model_id: ELEVEN_MODEL, text }),
     signal
   });
 
@@ -178,77 +159,10 @@ async function makeOutboundCall(phoneE164) {
     url: `${PUBLIC_BASE_URL}/twiml`
   });
 
-  console.log(`[${new Date().toISOString()}] Outbound call created CallSid=${call.sid} to=${phoneE164}`);
+  console.log(
+    `[${new Date().toISOString()}] Outbound call created CallSid=${call.sid} to=${phoneE164}`
+  );
   return call;
-}
-
-/* =======================
-   TRELLO POLLER
-======================= */
-let trelloLock = false;
-
-async function pollTrelloLeads() {
-  if (!TRELLO_ENABLED) return;
-  if (trelloLock) return;
-  trelloLock = true;
-
-  try {
-    const url = `https://api.trello.com/1/lists/${TRELLO_LIST_ID}/cards?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
-    const res = await fetch(url);
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      console.error(`Trello fetch failed ${res.status}: ${txt}`);
-      return;
-    }
-
-    const cards = await res.json();
-    if (!Array.isArray(cards)) return;
-
-    for (const card of cards) {
-      const hasCalled = (card.labels || []).some((l) => (l.name || '').toUpperCase() === 'GEBELD');
-      if (hasCalled) continue;
-
-      const rawPhone = extractPhoneFromText(card.desc || '');
-      if (!rawPhone) continue;
-
-      const phone = normalizePhone(rawPhone);
-      if (!phone) continue;
-
-      console.log(`Trello calling card=${card.id} phone=${phone} raw=${rawPhone}`);
-
-      try {
-        await makeOutboundCall(phone);
-      } catch (e) {
-        console.error(`Trello call failed card=${card.id}: ${e.message}`);
-        continue;
-      }
-
-      const labelUrl = `https://api.trello.com/1/cards/${card.id}/labels?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
-      const labelRes = await fetch(labelUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: 'GEBELD', color: 'green' })
-      });
-
-      if (!labelRes.ok) {
-        const txt = await labelRes.text().catch(() => '');
-        console.error(`Failed to label GEBELD card=${card.id}: ${txt}`);
-      } else {
-        console.log(`Trello labeled GEBELD card=${card.id}`);
-      }
-    }
-  } catch (e) {
-    console.error(`Trello poll error: ${e.message}`);
-  } finally {
-    trelloLock = false;
-  }
-}
-
-if (TRELLO_ENABLED) {
-  console.log('Trello poller enabled');
-  setInterval(pollTrelloLeads, 15000);
-} else {
-  console.log('Trello poller disabled (missing TRELLO_KEY/TRELLO_TOKEN/TRELLO_LIST_ID)');
 }
 
 /* =======================
@@ -315,6 +229,9 @@ wss.on('connection', (twilioWs) => {
 
   let callActive = true;
   let currentAbort = null;
+
+  // NEW: only speak OpenAI after user has spoken at least once
+  let userHasSpoken = false;
 
   // TTS queue
   let speaking = false;
@@ -474,6 +391,15 @@ wss.on('connection', (twilioWs) => {
     try { evt = JSON.parse(raw); } catch { return; }
     if (!callActive) return;
 
+    // NEW: mark that the user actually spoke
+    if (evt.type === 'input_audio_buffer.speech_started') {
+      if (!userHasSpoken) {
+        userHasSpoken = true;
+        console.log(`[${new Date().toISOString()}] userHasSpoken=true (OpenAI speech_started)`);
+      }
+      return;
+    }
+
     if (evt.type === 'response.created' || evt.type === 'response.output_item.added') {
       transcriptBuf = '';
       transcriptSeen = false;
@@ -486,13 +412,22 @@ wss.on('connection', (twilioWs) => {
       return;
     }
 
-    if (evt.type === 'response.audio_transcript.done' || evt.type === 'response.done') {
-      if (transcriptSeen) {
-        const text = transcriptBuf.trim();
-        transcriptBuf = '';
-        transcriptSeen = false;
-        if (text) enqueueSpeak(text);
+    // IMPORTANT: only speak on response.done (single trigger)
+    if (evt.type === 'response.done') {
+      const text = transcriptBuf.trim();
+      transcriptBuf = '';
+      transcriptSeen = false;
+
+      if (!text) return;
+
+      if (!userHasSpoken) {
+        console.log(
+          `[${new Date().toISOString()}] Skipping OpenAI speech (userHasSpoken=false) text="${text.slice(0, 80)}"`
+        );
+        return;
       }
+
+      enqueueSpeak(text);
       return;
     }
 
