@@ -18,7 +18,6 @@ const INSTRUCTIONS_OUTBOUND = process.env.INSTRUCTIONS_OUTBOUND || process.env.I
 const OUTBOUND_OPENING = process.env.OUTBOUND_OPENING || 'Hoi, met Tessa van Move2Go Solutions.';
 const OUTBOUND_OPENING_DELAY_MS = parseInt(process.env.OUTBOUND_OPENING_DELAY_MS || '700', 10);
 
-// Outbound guard: prevent OpenAI from re-introducing
 const OUTBOUND_GUARD = `
 BELANGRIJK (OUTBOUND):
 - Dit is OUTBOUND: jij belt de klant. Zeg NOOIT "leuk dat u belt".
@@ -159,9 +158,7 @@ async function makeOutboundCall(phoneE164) {
     url: `${PUBLIC_BASE_URL}/twiml`
   });
 
-  console.log(
-    `[${new Date().toISOString()}] Outbound call created CallSid=${call.sid} to=${phoneE164}`
-  );
+  console.log(`[${new Date().toISOString()}] Outbound call created CallSid=${call.sid} to=${phoneE164}`);
   return call;
 }
 
@@ -200,7 +197,7 @@ const httpServer = http.createServer(async (req, res) => {
         return;
       }
 
-      console.log(`[${new Date().toISOString()}] /call-test raw=${raw} normalized=${phone}`);
+      console.log(`[${new Date().toISOString()}] /call-test raw= ${raw} normalized=${phone}`);
       const call = await makeOutboundCall(phone);
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -230,16 +227,17 @@ wss.on('connection', (twilioWs) => {
   let callActive = true;
   let currentAbort = null;
 
-  // NEW: only speak OpenAI after user has spoken at least once
-  let userHasSpoken = false;
-
   // TTS queue
   let speaking = false;
   const speakQueue = [];
 
-  // OpenAI transcript aggregation
-  let transcriptBuf = '';
-  let transcriptSeen = false;
+  // OpenAI transcript aggregation (assistant)
+  let assistantTranscriptBuf = '';
+
+  // NEW: user-turn gating using transcription.completed
+  let userTurn = 0;
+  let assistantSpokenForTurn = 0;
+  let lastUserText = '';
 
   function safeTwilioSend(obj) {
     if (!callActive) return;
@@ -391,42 +389,41 @@ wss.on('connection', (twilioWs) => {
     try { evt = JSON.parse(raw); } catch { return; }
     if (!callActive) return;
 
-    // NEW: mark that the user actually spoke
-    if (evt.type === 'input_audio_buffer.speech_started') {
-      if (!userHasSpoken) {
-        userHasSpoken = true;
-        console.log(`[${new Date().toISOString()}] userHasSpoken=true (OpenAI speech_started)`);
+    // NEW: only trust actual transcription to mark a user turn
+    if (evt.type === 'conversation.item.input_audio_transcription.completed') {
+      const t = (evt.transcript || '').trim();
+      if (t) {
+        userTurn += 1;
+        lastUserText = t;
+        console.log(`[${new Date().toISOString()}] USER_TURN#${userTurn} text="${t.slice(0, 120)}"`);
       }
       return;
     }
 
-    if (evt.type === 'response.created' || evt.type === 'response.output_item.added') {
-      transcriptBuf = '';
-      transcriptSeen = false;
-      return;
-    }
-
+    // collect assistant transcript
     if (evt.type === 'response.audio_transcript.delta' && typeof evt.delta === 'string') {
-      transcriptSeen = true;
-      transcriptBuf += evt.delta;
+      assistantTranscriptBuf += evt.delta;
       return;
     }
 
-    // IMPORTANT: only speak on response.done (single trigger)
+    // IMPORTANT: speak only once per USER_TURN
     if (evt.type === 'response.done') {
-      const text = transcriptBuf.trim();
-      transcriptBuf = '';
-      transcriptSeen = false;
+      const text = assistantTranscriptBuf.trim();
+      assistantTranscriptBuf = '';
 
       if (!text) return;
 
-      if (!userHasSpoken) {
-        console.log(
-          `[${new Date().toISOString()}] Skipping OpenAI speech (userHasSpoken=false) text="${text.slice(0, 80)}"`
-        );
+      if (userTurn === 0) {
+        console.log(`[${new Date().toISOString()}] Skip assistant (no USER_TURN yet) text="${text.slice(0, 80)}"`);
         return;
       }
 
+      if (assistantSpokenForTurn >= userTurn) {
+        console.log(`[${new Date().toISOString()}] Skip assistant (already spoke for USER_TURN#${userTurn})`);
+        return;
+      }
+
+      assistantSpokenForTurn = userTurn;
       enqueueSpeak(text);
       return;
     }
