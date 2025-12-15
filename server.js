@@ -14,8 +14,10 @@ const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SPEED = parseFloat(process.env.SPEED || '1.0');
 
-const INSTRUCTIONS_INBOUND = process.env.INSTRUCTIONS_INBOUND || '';
 const INSTRUCTIONS_OUTBOUND = process.env.INSTRUCTIONS_OUTBOUND || process.env.INSTRUCTIONS || '';
+const OUTBOUND_OPENING =
+  process.env.OUTBOUND_OPENING ||
+  'Hoi, met Tessa van Move2Go Solutions.';
 
 const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
@@ -36,6 +38,15 @@ const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
 
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
+
+/* =======================
+   TRELLO
+======================= */
+const TRELLO_KEY = process.env.TRELLO_KEY;
+const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
+const TRELLO_LIST_ID = process.env.TRELLO_LIST_ID;
+
+const TRELLO_ENABLED = !!(TRELLO_KEY && TRELLO_TOKEN && TRELLO_LIST_ID);
 
 /* =======================
    PHONE NORMALIZATION (NL)
@@ -59,6 +70,12 @@ function normalizePhone(raw) {
   if (s.startsWith('6') && s.length === 9) return `+316${s.slice(1)}`;
 
   return null;
+}
+
+function extractPhoneFromText(text) {
+  const t = text || '';
+  const m = t.match(/(\+?[0-9][0-9()\-\s]{7,20})/);
+  return m ? m[0].trim() : null;
 }
 
 /* =======================
@@ -99,9 +116,7 @@ async function elevenSpeak(text, onUlaw) {
 
   if (!res.ok) {
     const err = await res.text().catch(() => '');
-    try {
-      ff.stdin.end();
-    } catch {}
+    try { ff.stdin.end(); } catch {}
     throw new Error(`ELEVEN_STREAM_FAILED ${res.status}: ${err}`);
   }
 
@@ -112,11 +127,112 @@ async function elevenSpeak(text, onUlaw) {
 }
 
 /* =======================
+   OUTBOUND CALL
+======================= */
+async function makeOutboundCall(phoneE164) {
+  if (!twilioClient) throw new Error('TWILIO_NOT_CONFIGURED');
+  if (!TWILIO_FROM) throw new Error('TWILIO_FROM_MISSING');
+  if (!PUBLIC_BASE_URL) throw new Error('PUBLIC_BASE_URL_MISSING');
+
+  const call = await twilioClient.calls.create({
+    to: phoneE164,
+    from: TWILIO_FROM,
+    url: `${PUBLIC_BASE_URL}/twiml`
+  });
+
+  console.log(`[${new Date().toISOString()}] Outbound call created CallSid=${call.sid} to=${phoneE164}`);
+  return call;
+}
+
+/* =======================
+   TRELLO POLLER
+======================= */
+let trelloLock = false;
+
+async function pollTrelloLeads() {
+  if (!TRELLO_ENABLED) return;
+  if (trelloLock) return;
+  trelloLock = true;
+
+  try {
+    const url = `https://api.trello.com/1/lists/${TRELLO_LIST_ID}/cards?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      console.error(`Trello fetch failed ${res.status}: ${txt}`);
+      return;
+    }
+
+    const cards = await res.json();
+    if (!Array.isArray(cards)) return;
+
+    for (const card of cards) {
+      const hasCalled = (card.labels || []).some((l) => (l.name || '').toUpperCase() === 'GEBELD');
+      if (hasCalled) continue;
+
+      const rawPhone = extractPhoneFromText(card.desc || '');
+      if (!rawPhone) {
+        console.log(`Trello skip card=${card.id} (no phone in desc)`);
+        continue;
+      }
+
+      const phone = normalizePhone(rawPhone);
+      if (!phone) {
+        console.log(`Trello skip card=${card.id} (bad phone raw=${rawPhone})`);
+        continue;
+      }
+
+      console.log(`Trello calling card=${card.id} phone=${phone} raw=${rawPhone}`);
+
+      try {
+        await makeOutboundCall(phone);
+      } catch (e) {
+        console.error(`Trello call failed card=${card.id}: ${e.message}`);
+        continue;
+      }
+
+      // Add "GEBELD" label
+      const labelUrl = `https://api.trello.com/1/cards/${card.id}/labels?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
+      const labelRes = await fetch(labelUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'GEBELD', color: 'green' })
+      });
+
+      if (!labelRes.ok) {
+        const txt = await labelRes.text().catch(() => '');
+        console.error(`Failed to label GEBELD card=${card.id}: ${txt}`);
+      } else {
+        console.log(`Trello labeled GEBELD card=${card.id}`);
+      }
+    }
+  } catch (e) {
+    console.error(`Trello poll error: ${e.message}`);
+  } finally {
+    trelloLock = false;
+  }
+}
+
+if (TRELLO_ENABLED) {
+  console.log('Trello poller enabled');
+  setInterval(pollTrelloLeads, 15000);
+} else {
+  console.log('Trello poller disabled (missing TRELLO_KEY/TRELLO_TOKEN/TRELLO_LIST_ID)');
+}
+
+/* =======================
    HTTP SERVER
 ======================= */
 const httpServer = http.createServer(async (req, res) => {
-  // Twilio Voice webhook → TwiML with Media Stream
-  if (req.url === '/twiml' && (req.method === 'POST' || req.method === 'GET')) {
+  if (req.url && req.url.startsWith('/health')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, ts: new Date().toISOString() }));
+    return;
+  }
+
+  // IMPORTANT: Twilio often calls /twiml?CallSid=...
+  if (req.url && req.url.startsWith('/twiml') && (req.method === 'POST' || req.method === 'GET')) {
+    console.log(`[${new Date().toISOString()}] TwiML hit method=${req.method} url=${req.url}`);
     const wsUrl = `wss://${req.headers.host}`;
     res.writeHead(200, { 'Content-Type': 'text/xml' });
     res.end(`<?xml version="1.0" encoding="UTF-8"?>
@@ -128,34 +244,26 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // Outbound test endpoint
-  if (req.url.startsWith('/call-test') && req.method === 'GET') {
+  if (req.url && req.url.startsWith('/call-test') && req.method === 'GET') {
     try {
-      if (!twilioClient) throw new Error('TWILIO_NOT_CONFIGURED');
-      if (!TWILIO_FROM) throw new Error('TWILIO_FROM_MISSING');
-      if (!PUBLIC_BASE_URL) throw new Error('PUBLIC_BASE_URL_MISSING');
-
       const url = new URL(req.url, `http://${req.headers.host}`);
       const raw = url.searchParams.get('phone');
       const phone = normalizePhone(raw);
 
-      if (!phone) {
+      if (!raw || !phone) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: `Invalid phone number: ${raw}` }));
         return;
       }
 
-      const call = await twilioClient.calls.create({
-        to: phone,
-        from: TWILIO_FROM,
-        url: `${PUBLIC_BASE_URL}/twiml`
-      });
+      console.log(`[${new Date().toISOString()}] /call-test raw=${raw} normalized=${phone}`);
+      const call = await makeOutboundCall(phone);
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, to: phone, sid: call.sid }));
       return;
     } catch (e) {
-      console.error('/call-test error:', e.message);
+      console.error(`/call-test error: ${e.message}`);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: e.message }));
       return;
@@ -167,41 +275,30 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 /* =======================
-   WEBSOCKET SERVER
+   WEBSOCKET SERVER (Twilio Media Stream)
 ======================= */
 const wss = new WebSocketServer({ server: httpServer });
 
 wss.on('connection', (twilioWs) => {
   let streamSid = null;
 
-  // Direction is unknown until Twilio start event arrives
-  let callDirection = null; // e.g. "inbound", "outbound-api"
-  let twilioStarted = false;
+  // Outbound-only focus: greet once immediately after start
+  let greeted = false;
 
-  // OpenAI readiness and session state
-  let openaiReady = false;
-  let sessionConfigured = false;
-
-  // Inbound greeting control
-  let pendingInboundGreeting = false;
-  let inboundGreetSent = false;
-
-  // TTS queue to avoid overlap
+  // TTS queue (avoid overlap)
   let speaking = false;
   const speakQueue = [];
 
-  // Assistant transcript aggregation
+  // transcript aggregation from OpenAI
   let transcriptBuf = '';
   let transcriptSeen = false;
 
   function safeTwilioSend(obj) {
     if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
-    try {
-      twilioWs.send(JSON.stringify(obj));
-    } catch {}
+    try { twilioWs.send(JSON.stringify(obj)); } catch {}
   }
 
-  // μ-law framing (20ms = 160 bytes @ 8kHz mono)
+  // μ-law framing (20ms = 160 bytes @ 8kHz)
   let ulawBuffer = Buffer.alloc(0);
   function pushAndSendUlaw(chunk) {
     ulawBuffer = Buffer.concat([ulawBuffer, chunk]);
@@ -223,8 +320,14 @@ wss.on('connection', (twilioWs) => {
     if (!next) return;
 
     speaking = true;
+    const started = Date.now();
+
     elevenSpeak(next, pushAndSendUlaw)
-      .catch((e) => console.error('Eleven error:', e.message))
+      .then(() => {
+        const ms = Date.now() - started;
+        console.log(`[${new Date().toISOString()}] Eleven spoke ms=${ms} text="${next.slice(0, 80)}"`);
+      })
+      .catch((e) => console.error(`Eleven error: ${e.message}`))
       .finally(() => {
         speaking = false;
         pumpSpeakQueue();
@@ -238,12 +341,7 @@ wss.on('connection', (twilioWs) => {
     pumpSpeakQueue();
   }
 
-  function chooseInstructions() {
-    const dir = (callDirection || '').toLowerCase();
-    if (dir === 'inbound') return INSTRUCTIONS_INBOUND || INSTRUCTIONS_OUTBOUND;
-    return INSTRUCTIONS_OUTBOUND;
-  }
-
+  // OpenAI Realtime WS
   const openaiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview', {
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -252,26 +350,16 @@ wss.on('connection', (twilioWs) => {
   });
 
   function safeOpenAISend(obj) {
-    if (openaiWs.readyState !== WebSocket.OPEN) return false;
-    try {
-      openaiWs.send(JSON.stringify(obj));
-      return true;
-    } catch {
-      return false;
-    }
+    if (openaiWs.readyState !== WebSocket.OPEN) return;
+    try { openaiWs.send(JSON.stringify(obj)); } catch {}
   }
 
-  function configureSessionIfReady() {
-    if (!openaiReady || !twilioStarted) return;
-    if (sessionConfigured) return;
-
-    const instructions = chooseInstructions();
-
+  openaiWs.on('open', () => {
     safeOpenAISend({
       type: 'session.update',
       session: {
         modalities: ['audio', 'text'],
-        instructions,
+        instructions: INSTRUCTIONS_OUTBOUND,
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         input_audio_transcription: { model: 'whisper-1' },
@@ -287,91 +375,41 @@ wss.on('connection', (twilioWs) => {
         speed: SPEED
       }
     });
-
-    sessionConfigured = true;
-
-    // If inbound greeting was requested before OpenAI was ready, send it now
-    if (pendingInboundGreeting && !inboundGreetSent) {
-      sendInboundGreetingNow();
-    }
-  }
-
-  function sendInboundGreetingNow() {
-    if (inboundGreetSent) return;
-    if (!openaiReady || !sessionConfigured) return;
-
-    inboundGreetSent = true;
-    pendingInboundGreeting = false;
-
-    // Ask OpenAI to produce the greeting (we will speak it via Eleven using transcript)
-    safeOpenAISend({
-      type: 'response.create',
-      response: {
-        modalities: ['audio', 'text'],
-        instructions:
-          'Neem nu de telefoon op met jouw openingszin volgens de instructions. Houd het bij 1 korte zin.'
-      }
-    });
-  }
-
-  openaiWs.on('open', () => {
-    openaiReady = true;
-    configureSessionIfReady();
   });
 
+  // Twilio → OpenAI
   twilioWs.on('message', (msg) => {
     let data;
-    try {
-      data = JSON.parse(msg);
-    } catch (e) {
-      console.error('Twilio JSON parse error:', e.message);
-      return;
-    }
+    try { data = JSON.parse(msg); } catch { return; }
 
     if (data.event === 'start') {
       streamSid = data.start.streamSid;
-      callDirection = data.start.direction || null;
-      twilioStarted = true;
+      console.log(`[${new Date().toISOString()}] Twilio start streamSid=${streamSid} direction=${data.start.direction || 'unknown'}`);
 
-      // If inbound, we want Tessa to greet first
-      if ((callDirection || '').toLowerCase() === 'inbound') {
-        pendingInboundGreeting = true;
+      // Fast first reaction: speak fixed opening immediately (Eleven), once per call.
+      if (!greeted) {
+        greeted = true;
+        enqueueSpeak(OUTBOUND_OPENING);
       }
-
-      configureSessionIfReady();
-
-      // If already configured and inbound, greet immediately
-      if (pendingInboundGreeting && openaiReady && sessionConfigured && !inboundGreetSent) {
-        sendInboundGreetingNow();
-      }
-
       return;
     }
 
     if (data.event === 'media') {
-      safeOpenAISend({
-        type: 'input_audio_buffer.append',
-        audio: data.media.payload
-      });
+      safeOpenAISend({ type: 'input_audio_buffer.append', audio: data.media.payload });
       return;
     }
 
     if (data.event === 'stop') {
-      try {
-        if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
-      } catch {}
+      console.log(`[${new Date().toISOString()}] Twilio stop streamSid=${streamSid}`);
+      try { if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); } catch {}
       return;
     }
   });
 
+  // OpenAI → transcript → Eleven
   openaiWs.on('message', async (raw) => {
     let evt;
-    try {
-      evt = JSON.parse(raw);
-    } catch (e) {
-      console.error('OpenAI JSON parse error:', e.message);
-      return;
-    }
+    try { evt = JSON.parse(raw); } catch { return; }
 
     if (evt.type === 'response.created' || evt.type === 'response.output_item.added') {
       transcriptBuf = '';
@@ -396,35 +434,22 @@ wss.on('connection', (twilioWs) => {
     }
 
     if (evt.type === 'error') {
-      console.error('OpenAI error:', JSON.stringify(evt.error));
+      console.error(`OpenAI error: ${JSON.stringify(evt.error)}`);
     }
   });
 
   openaiWs.on('close', (code) => {
-    openaiReady = false;
-    try {
-      if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
-    } catch {}
+    console.log(`[${new Date().toISOString()}] OpenAI WS closed code=${code}`);
+    try { if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close(); } catch {}
   });
 
   openaiWs.on('error', (e) => {
-    openaiReady = false;
-    console.error('OpenAI WS error:', e.message);
-    try {
-      if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
-    } catch {}
+    console.error(`OpenAI WS error: ${e.message}`);
+    try { if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close(); } catch {}
   });
 
   twilioWs.on('close', () => {
-    try {
-      if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
-    } catch {}
-  });
-
-  twilioWs.on('error', () => {
-    try {
-      if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
-    } catch {}
+    try { if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); } catch {}
   });
 });
 
