@@ -388,9 +388,11 @@ wss.on('connection', (twilioWs) => {
 
       // Fast first reaction: speak fixed opening immediately (Eleven), once per call.
       if (!greeted) {
-        greeted = true;
-        enqueueSpeak(OUTBOUND_OPENING);
-      }
+  greeted = true;
+  setTimeout(() => {
+    enqueueSpeak(OUTBOUND_OPENING);
+  }, 700); // ms
+}
       return;
     }
 
@@ -459,3 +461,4 @@ wss.on('connection', (twilioWs) => {
 httpServer.listen(PORT, () => {
   console.log(`Server live on ${PORT}`);
 });
+
