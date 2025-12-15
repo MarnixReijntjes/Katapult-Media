@@ -1,3 +1,12 @@
+const OpenAI = require("openai");
+
+function getOpenAIClient() {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY ontbreekt");
+  }
+  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+}
+
 async function generateReply({ systemPrompt, userText }) {
   const client = getOpenAIClient();
 
@@ -7,9 +16,31 @@ async function generateReply({ systemPrompt, userText }) {
       { role: "system", content: systemPrompt },
       { role: "user", content: userText }
     ],
-    max_output_tokens: 120
+    max_output_tokens: 150
   });
 
-  const text = (resp.output_text || "").trim();
-  return text; // Als er geen tekst is, komt er ook geen fallback.
+  // VEILIG uitlezen van response
+  if (!resp.output || !resp.output.length) {
+    throw new Error("OpenAI response leeg");
+  }
+
+  const texts = [];
+  for (const item of resp.output) {
+    if (item.content) {
+      for (const c of item.content) {
+        if (c.type === "output_text" && c.text) {
+          texts.push(c.text);
+        }
+      }
+    }
+  }
+
+  const finalText = texts.join(" ").trim();
+  if (!finalText) {
+    throw new Error("Geen tekst in OpenAI output");
+  }
+
+  return finalText;
 }
+
+module.exports = { generateReply };
