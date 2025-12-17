@@ -1,173 +1,113 @@
-import http from "http";
-import WebSocket, { WebSocketServer } from "ws";
-import { spawn } from "child_process";
-import dotenv from "dotenv";
-import fetch from "node-fetch";
+// companies/des/server.js
+import http from 'http';
+import WebSocket, { WebSocketServer } from 'ws';
+import dotenv from 'dotenv';
+import { spawn } from 'child_process';
 
 dotenv.config();
 
-/* ================= CONFIG ================= */
+/* =======================
+   CONFIG
+======================= */
 const PORT = process.env.PORT || 10000;
-const BASE_URL = process.env.PUBLIC_BASE_URL;
-const OPENAI_KEY = process.env.OPENAI_API_KEY;
+const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
+const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_multilingual_v2';
+const GREETING_TEXT = 'Hoi, met Tessa van DES.';
 
-const ELEVEN_KEY = process.env.ELEVENLABS_API_KEY;
-const ELEVEN_VOICE = process.env.ELEVENLABS_VOICE_ID;
-const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL;
+if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
+  console.error('❌ ElevenLabs vars missing');
+  process.exit(1);
+}
 
-const INSTRUCTIONS = process.env.INSTRUCTIONS_INBOUND;
-const HANGUP_TOKEN = process.env.HANGUP_TOKEN || "AFRONDEN_OK";
-
-/* ================= ELEVEN TTS ================= */
-async function elevenSpeakUlaw(text, pushFrame) {
-  const ff = spawn("ffmpeg", [
-    "-i", "pipe:0",
-    "-ar", "8000",
-    "-ac", "1",
-    "-f", "mulaw",
-    "pipe:1"
+/* =======================
+   ELEVEN → μLAW
+======================= */
+async function elevenToUlaw(text, onChunk) {
+  const ff = spawn('ffmpeg', [
+    '-i', 'pipe:0',
+    '-ar', '8000',
+    '-ac', '1',
+    '-f', 'mulaw',
+    'pipe:1'
   ]);
 
-  ff.stdout.on("data", pushFrame);
+  ff.stdout.on('data', onChunk);
 
   const res = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE}/stream`,
+    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream`,
     {
-      method: "POST",
+      method: 'POST',
       headers: {
-        "xi-api-key": ELEVEN_KEY,
-        "Content-Type": "application/json",
-        Accept: "audio/mpeg"
+        'xi-api-key': ELEVEN_API_KEY,
+        'Content-Type': 'application/json',
+        Accept: 'audio/mpeg'
       },
-      body: JSON.stringify({ model_id: ELEVEN_MODEL, text })
+      body: JSON.stringify({ text, model_id: ELEVEN_MODEL })
     }
   );
 
-  const { Readable } = await import("stream");
-  Readable.fromWeb(res.body).pipe(ff.stdin);
+  const reader = res.body.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    ff.stdin.write(Buffer.from(value));
+  }
 
-  await new Promise(r => ff.on("close", r));
+  ff.stdin.end();
+  await new Promise(r => ff.on('close', r));
 }
 
-/* ================= HTTP ================= */
-const server = http.createServer((req, res) => {
-  if (req.url === "/twiml") {
-    res.writeHead(200, { "Content-Type": "text/xml" });
-    res.end(`
+/* =======================
+   HTTP + TWIML
+======================= */
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'POST' && req.url === '/twiml') {
+    res.writeHead(200, { 'Content-Type': 'text/xml' });
+    res.end(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Play>https://${req.headers.host}/greeting</Play>
   <Connect>
-    <Stream url="wss://${req.headers.host}/ws"/>
+    <Stream url="wss://${req.headers.host}/ws" />
   </Connect>
-</Response>
-    `.trim());
+</Response>`);
     return;
   }
+
+  if (req.url === '/greeting') {
+    res.writeHead(200, { 'Content-Type': 'audio/mulaw' });
+    await elevenToUlaw(GREETING_TEXT, chunk => res.write(chunk));
+    res.end();
+    return;
+  }
+
   res.writeHead(404);
   res.end();
 });
 
-/* ================= WS ================= */
+/* =======================
+   WEBSOCKET (Twilio Media)
+======================= */
 const wss = new WebSocketServer({ server });
 
-wss.on("connection", twilioWs => {
+wss.on('connection', ws => {
   let streamSid;
-  let speaking = false;
-  let hangupTimer = null;
 
-  const audioBuffer = [];
-  function sendFrame(frame) {
-    if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
-    twilioWs.send(JSON.stringify({
-      event: "media",
-      streamSid,
-      media: { payload: frame.toString("base64") }
-    }));
-  }
-
-  const openaiWs = new WebSocket(
-    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_KEY}`,
-        "OpenAI-Beta": "realtime=v1"
-      }
-    }
-  );
-
-  openaiWs.on("open", () => {
-    openaiWs.send(JSON.stringify({
-      type: "session.update",
-      session: {
-        modalities: ["text"],
-        instructions: INSTRUCTIONS,
-        input_audio_format: "g711_ulaw",
-        input_audio_transcription: { model: "whisper-1" },
-        turn_detection: { type: "server_vad" }
-      }
-    }));
-  });
-
-  let transcript = "";
-
-  openaiWs.on("message", async raw => {
-    const evt = JSON.parse(raw);
-
-    if (evt.type === "response.audio_transcript.delta") {
-      transcript += evt.delta;
-    }
-
-    if (evt.type === "response.audio_transcript.done") {
-      const text = transcript.trim();
-      transcript = "";
-
-      if (!text) return;
-
-      speaking = true;
-      await elevenSpeakUlaw(text, sendFrame);
-      speaking = false;
-
-      if (text.includes(HANGUP_TOKEN)) {
-        hangupTimer = setTimeout(() => {
-          twilioWs.close();
-        }, 2500);
-      }
-    }
-
-    if (evt.type === "input_audio_buffer.speech_started") {
-      if (hangupTimer) {
-        clearTimeout(hangupTimer);
-        hangupTimer = null;
-      }
-    }
-  });
-
-  twilioWs.on("message", msg => {
+  ws.on('message', msg => {
     const data = JSON.parse(msg);
-
-    if (data.event === "start") {
+    if (data.event === 'start') {
       streamSid = data.start.streamSid;
-
-      elevenSpeakUlaw(
-        "Hoi, met Tessa van Move2Go Solutions.",
-        sendFrame
-      );
+      console.log('📞 inbound stream', streamSid);
     }
-
-    if (data.event === "media") {
-      openaiWs.send(JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: data.media.payload
-      }));
-    }
-
-    if (data.event === "stop") {
-      openaiWs.close();
+    if (data.event === 'stop') {
+      ws.close();
     }
   });
-
 });
 
-/* ================= START ================= */
-server.listen(PORT, () =>
-  console.log(`✅ DES inbound live on ${PORT}`)
-);
+/* =======================
+   START
+======================= */
+server.listen(PORT, () => {
+  console.log(`✅ DES inbound live on ${PORT}`);
+});
