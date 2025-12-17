@@ -8,27 +8,18 @@ import crypto from "crypto";
 
 dotenv.config();
 
-/* =======================
-   CONFIG
-======================= */
 const PORT = process.env.PORT || 10000;
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const INBOUND_GREETING = process.env.INBOUND_GREETING || "Hoi, met Tessa van DES.";
+const INSTRUCTIONS_INBOUND =
+  process.env.INSTRUCTIONS_INBOUND ||
+  "Je bent Tessa, inbound receptionist. Antwoord kort, vriendelijk, 1 vraag tegelijk. Nederlands.";
 
 const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL || "eleven_multilingual_v2";
 
-const INSTRUCTIONS_INBOUND =
-  process.env.INSTRUCTIONS_INBOUND ||
-  "Je bent Tessa, inbound receptionist. Antwoord kort, vriendelijk, 1 vraag tegelijk. Nederlands.";
-
-const INBOUND_GREETING =
-  process.env.INBOUND_GREETING || "Hoi, met Tessa van DES.";
-
-const HANGUP_TOKEN = process.env.HANGUP_TOKEN || "AFRONDEN_OK";
-const HANGUP_DELAY_MS = Number(process.env.HANGUP_DELAY_MS || 2500);
-
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 if (!OPENAI_API_KEY) {
   console.error("❌ OPENAI_API_KEY missing");
   process.exit(1);
@@ -59,10 +50,10 @@ function sha1(s) {
 }
 
 /* =========================
-   Eleven greeting cache (mp3 for <Play>)
+   ElevenLabs greeting cache (mp3 for <Play>)
 ========================= */
 let cachedMp3 = null;
-let cachedGreetingText = null;
+let cachedText = null;
 let cachedAt = 0;
 
 async function synthesizeElevenMp3(text) {
@@ -94,7 +85,7 @@ async function synthesizeElevenMp3(text) {
 }
 
 /* =========================
-   Eleven streaming -> ffmpeg -> ulaw bytes callback
+   ElevenLabs streaming -> ffmpeg -> ulaw bytes callback
    Supports AbortController for barge-in
 ========================= */
 async function elevenStreamToUlaw(text, onUlawChunk, abortSignal) {
@@ -132,7 +123,9 @@ async function elevenStreamToUlaw(text, onUlawChunk, abortSignal) {
     }
     abortSignal.addEventListener(
       "abort",
-      () => cleanup(),
+      () => {
+        cleanup();
+      },
       { once: true }
     );
   }
@@ -219,6 +212,7 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/health") {
       return sendJson(res, 200, {
         ok: true,
+        service: "des-inbound-eleven-greeting-openai-reply-barge-in-anti-double",
         ts: new Date().toISOString(),
       });
     }
@@ -229,13 +223,13 @@ const httpServer = http.createServer(async (req, res) => {
       const now = Date.now();
       const cacheValid =
         cachedMp3 &&
-        cachedGreetingText === INBOUND_GREETING &&
+        cachedText === INBOUND_GREETING &&
         now - cachedAt < 60 * 60 * 1000;
 
       if (!cacheValid) {
         const t0 = Date.now();
         cachedMp3 = await synthesizeElevenMp3(INBOUND_GREETING);
-        cachedGreetingText = INBOUND_GREETING;
+        cachedText = INBOUND_GREETING;
         cachedAt = Date.now();
         console.log(
           `[${new Date().toISOString()}] ✅ Eleven greeting bytes=${cachedMp3.length} ms=${Date.now() - t0}`
@@ -279,10 +273,9 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 /* =========================
-   WS: Twilio <-> OpenAI <-> Eleven
+   WebSockets: Twilio -> OpenAI -> Eleven -> Twilio
    - barge-in
-   - anti-double
-   - hangup via token + silence window
+   - anti-double: speak only on response.audio_transcript.done
 ========================= */
 const wss = new WebSocketServer({ server: httpServer });
 
@@ -315,7 +308,7 @@ wss.on("connection", (twilioWs, req) => {
     }
   }
 
-  // ----- Speech / barge-in -----
+  // ----- BARGE-IN STATE -----
   let speechToken = 0;
   let currentSpeech = null; // { token, abortController }
 
@@ -333,26 +326,6 @@ wss.on("connection", (twilioWs, req) => {
     twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
   }
 
-  let hangupTimer = null;
-  function armHangup(reason) {
-    if (hangupTimer) clearTimeout(hangupTimer);
-    hangupTimer = setTimeout(() => {
-      console.log(`[${new Date().toISOString()}] Hanging up (reason=${reason})`);
-      try {
-        twilioWs.close();
-      } catch {}
-    }, HANGUP_DELAY_MS);
-    console.log(
-      `[${new Date().toISOString()}] Hangup armed in ${HANGUP_DELAY_MS}ms (reason=${reason})`
-    );
-  }
-  function disarmHangup(reason) {
-    if (!hangupTimer) return;
-    clearTimeout(hangupTimer);
-    hangupTimer = null;
-    console.log(`[${new Date().toISOString()}] Hangup disarmed (reason=${reason})`);
-  }
-
   async function speak(text) {
     const t = (text || "").trim();
     if (!t) return;
@@ -364,9 +337,7 @@ wss.on("connection", (twilioWs, req) => {
     currentSpeech = { token: myToken, abortController };
 
     const t0 = Date.now();
-    console.log(
-      `[${new Date().toISOString()}] SPEAK_START text="${t.slice(0, 180)}"`
-    );
+    console.log(`[${new Date().toISOString()}] SPEAK_START text="${t.slice(0, 140)}"`);
 
     try {
       await elevenStreamToUlaw(
@@ -382,11 +353,6 @@ wss.on("connection", (twilioWs, req) => {
       if (speechToken !== myToken) return;
 
       console.log(`[${new Date().toISOString()}] SPEAK_DONE ms=${Date.now() - t0}`);
-
-      // Hangup token check AFTER speaking finished (so we never cut mid-sentence)
-      if (t.includes(HANGUP_TOKEN)) {
-        armHangup("token_seen");
-      }
     } catch (e) {
       if (abortController.signal.aborted) return;
       console.error("❌ SPEAK_ERROR:", e.message);
@@ -397,7 +363,6 @@ wss.on("connection", (twilioWs, req) => {
     }
   }
 
-  // ----- OpenAI Realtime -----
   const openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
     {
@@ -458,7 +423,6 @@ wss.on("connection", (twilioWs, req) => {
 
     if (msg.event === "stop") {
       console.log(`[${new Date().toISOString()}] Twilio stop streamSid=${streamSid}`);
-      disarmHangup("twilio_stop");
       cancelSpeech("twilio_stop");
       if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
       return;
@@ -469,7 +433,7 @@ wss.on("connection", (twilioWs, req) => {
   let assistantBuf = "";
   let assistantSeen = false;
 
-  // Anti-double: speak only on transcript.done + hash dedupe window
+  // Anti-double: speak only on transcript.done + hash dedupe (short window)
   let lastSpokenHash = "";
   let lastSpokenAt = 0;
   const DEDUPE_WINDOW_MS = 5000;
@@ -484,7 +448,6 @@ wss.on("connection", (twilioWs, req) => {
 
     if (evt.type === "input_audio_buffer.speech_started") {
       console.log(`[${new Date().toISOString()}] 🎙️ speech_started (barge-in)`);
-      disarmHangup("barge_in");
       speechToken++;
       cancelSpeech("barge_in");
       twilioClear();
@@ -507,7 +470,7 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    // Speak ONLY here (anti-double)
+    // ✅ Speak ONLY here (anti-double)
     if (evt.type === "response.audio_transcript.done") {
       if (!assistantSeen) return;
 
@@ -527,6 +490,8 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
+    // response.done is intentionally ignored to prevent duplicates
+
     if (evt.type === "error") {
       console.error(`[${new Date().toISOString()}] ❌ OpenAI error:`, JSON.stringify(evt.error));
     }
@@ -534,7 +499,6 @@ wss.on("connection", (twilioWs, req) => {
 
   openaiWs.on("close", (code) => {
     console.log(`[${new Date().toISOString()}] OpenAI WS closed code=${code}`);
-    disarmHangup("openai_close");
     cancelSpeech("openai_ws_close");
     if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
   });
@@ -545,21 +509,17 @@ wss.on("connection", (twilioWs, req) => {
 
   twilioWs.on("close", () => {
     console.log(`[${new Date().toISOString()}] Twilio WS closed streamSid=${streamSid}`);
-    disarmHangup("twilio_ws_close");
     cancelSpeech("twilio_ws_close");
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
 
   twilioWs.on("error", (e) => {
     console.error(`[${new Date().toISOString()}] Twilio WS error:`, e.message);
-    disarmHangup("twilio_ws_error");
     cancelSpeech("twilio_ws_error");
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
 });
 
 httpServer.listen(PORT, () => {
-  console.log(
-    `✅ DES inbound live on ${PORT} (Eleven greeting + OpenAI reply + barge-in + anti-double + hangup-token)`
-  );
+  console.log(`✅ DES inbound: greeting + STT + reply via Eleven + barge-in + anti-double live on ${PORT}`);
 });
