@@ -4,6 +4,7 @@ import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 import { spawn } from "child_process";
 import { Readable } from "stream";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -43,6 +44,9 @@ function escapeXml(s) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&apos;");
+}
+function sha1(s) {
+  return crypto.createHash("sha1").update(String(s)).digest("hex");
 }
 
 /* =========================
@@ -115,7 +119,7 @@ async function elevenStreamToUlaw(text, onUlawChunk, abortSignal) {
   if (abortSignal) {
     if (abortSignal.aborted) {
       cleanup();
-      return { ffmpeg: ff };
+      return;
     }
     abortSignal.addEventListener(
       "abort",
@@ -139,14 +143,13 @@ async function elevenStreamToUlaw(text, onUlawChunk, abortSignal) {
       signal: abortSignal,
     }
   ).catch((e) => {
-    // If aborted, just exit cleanly
     if (abortSignal?.aborted) return null;
     throw e;
   });
 
   if (!res) {
     cleanup();
-    return { ffmpeg: ff };
+    return;
   }
 
   if (!res.ok) {
@@ -196,8 +199,6 @@ async function elevenStreamToUlaw(text, onUlawChunk, abortSignal) {
     ff.on("close", resolve);
     ff.on("error", resolve);
   });
-
-  return { ffmpeg: ff };
 }
 
 /* =========================
@@ -211,7 +212,7 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/health") {
       return sendJson(res, 200, {
         ok: true,
-        service: "des-inbound-eleven-greeting-openai-reply-barge-in",
+        service: "des-inbound-eleven-greeting-openai-reply-barge-in-anti-double",
         ts: new Date().toISOString(),
       });
     }
@@ -272,7 +273,9 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 /* =========================
-   WebSockets: Twilio -> OpenAI -> Eleven -> Twilio (with barge-in)
+   WebSockets: Twilio -> OpenAI -> Eleven -> Twilio
+   - barge-in
+   - anti-double: speak only on response.audio_transcript.done
 ========================= */
 const wss = new WebSocketServer({ server: httpServer });
 
@@ -306,7 +309,7 @@ wss.on("connection", (twilioWs, req) => {
   }
 
   // ----- BARGE-IN STATE -----
-  let speechToken = 0; // increments on user speech_started
+  let speechToken = 0;
   let currentSpeech = null; // { token, abortController }
 
   function cancelSpeech(reason) {
@@ -327,8 +330,6 @@ wss.on("connection", (twilioWs, req) => {
     const t = (text || "").trim();
     if (!t) return;
     if (!streamSid) return;
-
-    // one active speech at a time
     if (currentSpeech) return;
 
     const myToken = speechToken;
@@ -339,27 +340,23 @@ wss.on("connection", (twilioWs, req) => {
     console.log(`[${new Date().toISOString()}] SPEAK_START text="${t.slice(0, 140)}"`);
 
     try {
-      await elevenStreamToUlaw(t, (chunk) => {
-        // Stop pushing frames if user barged in
-        if (speechToken !== myToken) return;
-        if (abortController.signal.aborted) return;
-        pushUlaw(chunk);
-      }, abortController.signal);
+      await elevenStreamToUlaw(
+        t,
+        (chunk) => {
+          if (speechToken !== myToken) return;
+          if (abortController.signal.aborted) return;
+          pushUlaw(chunk);
+        },
+        abortController.signal
+      );
 
-      // If token changed mid-speech, treat as cancelled
-      if (speechToken !== myToken) {
-        return;
-      }
+      if (speechToken !== myToken) return;
 
       console.log(`[${new Date().toISOString()}] SPEAK_DONE ms=${Date.now() - t0}`);
     } catch (e) {
-      if (abortController.signal.aborted) {
-        // cancelled on purpose
-        return;
-      }
+      if (abortController.signal.aborted) return;
       console.error("❌ SPEAK_ERROR:", e.message);
     } finally {
-      // Only clear if this speech is still "current"
       if (currentSpeech && currentSpeech.token === myToken) {
         currentSpeech = null;
       }
@@ -432,10 +429,14 @@ wss.on("connection", (twilioWs, req) => {
     }
   });
 
-  // OpenAI -> speak assistant text (with barge-in)
+  // OpenAI -> speak assistant text
   let assistantBuf = "";
   let assistantSeen = false;
-  let lastSpokenText = "";
+
+  // Anti-double: speak only on transcript.done + hash dedupe (short window)
+  let lastSpokenHash = "";
+  let lastSpokenAt = 0;
+  const DEDUPE_WINDOW_MS = 5000;
 
   openaiWs.on("message", async (raw) => {
     let evt;
@@ -447,7 +448,6 @@ wss.on("connection", (twilioWs, req) => {
 
     if (evt.type === "input_audio_buffer.speech_started") {
       console.log(`[${new Date().toISOString()}] 🎙️ speech_started (barge-in)`);
-      // user started talking -> stop any current speech immediately
       speechToken++;
       cancelSpeech("barge_in");
       twilioClear();
@@ -470,19 +470,27 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    if (evt.type === "response.audio_transcript.done" || evt.type === "response.done") {
+    // ✅ Speak ONLY here (anti-double)
+    if (evt.type === "response.audio_transcript.done") {
       if (!assistantSeen) return;
+
       const text = assistantBuf.trim();
       assistantBuf = "";
       assistantSeen = false;
 
-      // minimal de-dupe guard
-      if (text && text !== lastSpokenText) {
-        lastSpokenText = text;
-        await speak(text);
-      }
+      const now = Date.now();
+      const h = sha1(text);
+      const isDup = h === lastSpokenHash && now - lastSpokenAt < DEDUPE_WINDOW_MS;
+      if (!text || isDup) return;
+
+      lastSpokenHash = h;
+      lastSpokenAt = now;
+
+      await speak(text);
       return;
     }
+
+    // response.done is intentionally ignored to prevent duplicates
 
     if (evt.type === "error") {
       console.error(`[${new Date().toISOString()}] ❌ OpenAI error:`, JSON.stringify(evt.error));
@@ -513,5 +521,5 @@ wss.on("connection", (twilioWs, req) => {
 });
 
 httpServer.listen(PORT, () => {
-  console.log(`✅ DES inbound: greeting + STT + reply via Eleven + barge-in live on ${PORT}`);
+  console.log(`✅ DES inbound: greeting + STT + reply via Eleven + barge-in + anti-double live on ${PORT}`);
 });
