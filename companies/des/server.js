@@ -2,12 +2,17 @@
 import dotenv from "dotenv";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
+import { spawn } from "child_process";
+import { Readable } from "stream";
 
 dotenv.config();
 
 const PORT = process.env.PORT || 10000;
 
 const INBOUND_GREETING = process.env.INBOUND_GREETING || "Hoi, met Tessa van DES.";
+const INSTRUCTIONS_INBOUND =
+  process.env.INSTRUCTIONS_INBOUND ||
+  "Je bent Tessa, inbound receptionist. Antwoord kort, vriendelijk, 1 vraag tegelijk. Nederlands.";
 
 const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
@@ -76,6 +81,69 @@ async function synthesizeElevenMp3(text) {
 }
 
 /* =========================
+   ElevenLabs streaming -> ffmpeg -> ulaw bytes callback
+========================= */
+async function elevenStreamToUlaw(text, onUlawChunk) {
+  const ff = spawn("ffmpeg", [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    "pipe:0",
+    "-ar",
+    "8000",
+    "-ac",
+    "1",
+    "-f",
+    "mulaw",
+    "pipe:1",
+  ]);
+
+  ff.stdout.on("data", (chunk) => onUlawChunk(chunk));
+  ff.stderr.on("data", () => {});
+  ff.on("error", () => {});
+
+  const res = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVEN_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      body: JSON.stringify({ model_id: ELEVEN_MODEL, text }),
+    }
+  );
+
+  if (!res.ok) {
+    const err = await res.text().catch(() => "");
+    try {
+      ff.stdin.end();
+    } catch {}
+    throw new Error(`ELEVEN_STREAM_FAILED ${res.status}: ${err}`);
+  }
+
+  const nodeStream = Readable.fromWeb(res.body);
+  nodeStream.on("data", (d) => ff.stdin.write(d));
+  nodeStream.on("end", () => {
+    try {
+      ff.stdin.end();
+    } catch {}
+  });
+  nodeStream.on("error", () => {
+    try {
+      ff.stdin.end();
+    } catch {}
+  });
+
+  await new Promise((resolve) => {
+    ff.on("close", resolve);
+    ff.on("error", resolve);
+  });
+}
+
+/* =========================
    HTTP (TwiML + audio)
 ========================= */
 const httpServer = http.createServer(async (req, res) => {
@@ -86,7 +154,7 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/health") {
       return sendJson(res, 200, {
         ok: true,
-        service: "des-inbound-eleven-greeting-openai-stt-only",
+        service: "des-inbound-eleven-greeting-openai-reply-once",
         ts: new Date().toISOString(),
       });
     }
@@ -116,7 +184,6 @@ const httpServer = http.createServer(async (req, res) => {
       const audioUrl = `${baseUrl}/audio.mp3?ts=${Date.now()}`;
       const wsUrl = `wss://${req.headers.host}/ws`;
 
-      // Play greeting -> then connect stream
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${escapeXml(audioUrl)}</Play>
@@ -148,7 +215,7 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 /* =========================
-   WebSockets: Twilio -> OpenAI STT only
+   WebSockets: Twilio -> OpenAI -> Eleven -> Twilio
 ========================= */
 const wss = new WebSocketServer({ server: httpServer });
 
@@ -160,6 +227,46 @@ wss.on("connection", (twilioWs, req) => {
 
   let streamSid = null;
   console.log(`[${new Date().toISOString()}] WS connected url=${req.url}`);
+
+  // ulaw frame packing: 20ms @ 8kHz mono = 160 bytes
+  let ulawBuf = Buffer.alloc(0);
+  function pushUlaw(chunk) {
+    ulawBuf = Buffer.concat([ulawBuf, chunk]);
+    const frameSize = 160;
+    while (ulawBuf.length >= frameSize) {
+      const frame = ulawBuf.subarray(0, frameSize);
+      ulawBuf = ulawBuf.subarray(frameSize);
+
+      if (twilioWs.readyState !== WebSocket.OPEN || !streamSid) return;
+      twilioWs.send(
+        JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: frame.toString("base64") },
+        })
+      );
+    }
+  }
+
+  let speaking = false;
+  async function speak(text) {
+    const t = (text || "").trim();
+    if (!t) return;
+    if (speaking) return;
+    if (!streamSid) return;
+
+    speaking = true;
+    const t0 = Date.now();
+    console.log(`[${new Date().toISOString()}] SPEAK_START text="${t.slice(0, 120)}"`);
+    try {
+      await elevenStreamToUlaw(t, pushUlaw);
+      console.log(`[${new Date().toISOString()}] SPEAK_DONE ms=${Date.now() - t0}`);
+    } catch (e) {
+      console.error("❌ SPEAK_ERROR:", e.message);
+    } finally {
+      speaking = false;
+    }
+  }
 
   const openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
@@ -176,11 +283,11 @@ wss.on("connection", (twilioWs, req) => {
   }
 
   openaiWs.on("open", () => {
-    // Key change: create_response = false (STT only, no assistant responses)
     safeOpenAI({
       type: "session.update",
       session: {
-        modalities: ["text"],
+        modalities: ["audio", "text"],
+        instructions: INSTRUCTIONS_INBOUND,
         input_audio_format: "g711_ulaw",
         input_audio_transcription: { model: "whisper-1" },
         turn_detection: {
@@ -188,13 +295,16 @@ wss.on("connection", (twilioWs, req) => {
           threshold: 0.5,
           prefix_padding_ms: 300,
           silence_duration_ms: 500,
-          create_response: false,
+          create_response: true,
         },
+        temperature: 0.6,
+        max_response_output_tokens: 250,
       },
     });
-    console.log(`[${new Date().toISOString()}] OpenAI STT-only session ready`);
+    console.log(`[${new Date().toISOString()}] OpenAI session.update sent (reply enabled)`);
   });
 
+  // Twilio -> OpenAI audio
   twilioWs.on("message", (buf) => {
     let msg;
     try {
@@ -223,7 +333,12 @@ wss.on("connection", (twilioWs, req) => {
     }
   });
 
-  openaiWs.on("message", (raw) => {
+  // OpenAI -> speak assistant text (single pass)
+  let assistantBuf = "";
+  let assistantSeen = false;
+  let lastSpokenText = "";
+
+  openaiWs.on("message", async (raw) => {
     let evt;
     try {
       evt = JSON.parse(raw);
@@ -242,6 +357,26 @@ wss.on("connection", (twilioWs, req) => {
 
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       console.log(`[${new Date().toISOString()}] 📝 USER SAID: "${evt.transcript}"`);
+      return;
+    }
+
+    if (evt.type === "response.audio_transcript.delta" && typeof evt.delta === "string") {
+      assistantSeen = true;
+      assistantBuf += evt.delta;
+      return;
+    }
+
+    if (evt.type === "response.audio_transcript.done" || evt.type === "response.done") {
+      if (!assistantSeen) return;
+      const text = assistantBuf.trim();
+      assistantBuf = "";
+      assistantSeen = false;
+
+      // minimal de-dupe guard
+      if (text && text !== lastSpokenText) {
+        lastSpokenText = text;
+        await speak(text);
+      }
       return;
     }
 
@@ -271,5 +406,5 @@ wss.on("connection", (twilioWs, req) => {
 });
 
 httpServer.listen(PORT, () => {
-  console.log(`✅ DES inbound (Eleven greeting) + OpenAI STT-only live on ${PORT}`);
+  console.log(`✅ DES inbound: greeting + STT + 1 reply via Eleven live on ${PORT}`);
 });
