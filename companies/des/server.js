@@ -82,8 +82,9 @@ async function synthesizeElevenMp3(text) {
 
 /* =========================
    ElevenLabs streaming -> ffmpeg -> ulaw bytes callback
+   Supports AbortController for barge-in
 ========================= */
-async function elevenStreamToUlaw(text, onUlawChunk) {
+async function elevenStreamToUlaw(text, onUlawChunk, abortSignal) {
   const ff = spawn("ffmpeg", [
     "-hide_banner",
     "-loglevel",
@@ -101,7 +102,29 @@ async function elevenStreamToUlaw(text, onUlawChunk) {
 
   ff.stdout.on("data", (chunk) => onUlawChunk(chunk));
   ff.stderr.on("data", () => {});
-  ff.on("error", () => {});
+
+  const cleanup = () => {
+    try {
+      ff.stdin.end();
+    } catch {}
+    try {
+      ff.kill("SIGKILL");
+    } catch {}
+  };
+
+  if (abortSignal) {
+    if (abortSignal.aborted) {
+      cleanup();
+      return { ffmpeg: ff };
+    }
+    abortSignal.addEventListener(
+      "abort",
+      () => {
+        cleanup();
+      },
+      { once: true }
+    );
+  }
 
   const res = await fetch(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream`,
@@ -113,19 +136,51 @@ async function elevenStreamToUlaw(text, onUlawChunk) {
         Accept: "audio/mpeg",
       },
       body: JSON.stringify({ model_id: ELEVEN_MODEL, text }),
+      signal: abortSignal,
     }
-  );
+  ).catch((e) => {
+    // If aborted, just exit cleanly
+    if (abortSignal?.aborted) return null;
+    throw e;
+  });
+
+  if (!res) {
+    cleanup();
+    return { ffmpeg: ff };
+  }
 
   if (!res.ok) {
     const err = await res.text().catch(() => "");
-    try {
-      ff.stdin.end();
-    } catch {}
+    cleanup();
     throw new Error(`ELEVEN_STREAM_FAILED ${res.status}: ${err}`);
   }
 
   const nodeStream = Readable.fromWeb(res.body);
-  nodeStream.on("data", (d) => ff.stdin.write(d));
+
+  const stopNodeStream = () => {
+    try {
+      nodeStream.destroy();
+    } catch {}
+    try {
+      ff.stdin.end();
+    } catch {}
+  };
+
+  if (abortSignal) {
+    abortSignal.addEventListener(
+      "abort",
+      () => {
+        stopNodeStream();
+        cleanup();
+      },
+      { once: true }
+    );
+  }
+
+  nodeStream.on("data", (d) => {
+    if (abortSignal?.aborted) return;
+    ff.stdin.write(d);
+  });
   nodeStream.on("end", () => {
     try {
       ff.stdin.end();
@@ -141,6 +196,8 @@ async function elevenStreamToUlaw(text, onUlawChunk) {
     ff.on("close", resolve);
     ff.on("error", resolve);
   });
+
+  return { ffmpeg: ff };
 }
 
 /* =========================
@@ -154,7 +211,7 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/health") {
       return sendJson(res, 200, {
         ok: true,
-        service: "des-inbound-eleven-greeting-openai-reply-once",
+        service: "des-inbound-eleven-greeting-openai-reply-barge-in",
         ts: new Date().toISOString(),
       });
     }
@@ -215,7 +272,7 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 /* =========================
-   WebSockets: Twilio -> OpenAI -> Eleven -> Twilio
+   WebSockets: Twilio -> OpenAI -> Eleven -> Twilio (with barge-in)
 ========================= */
 const wss = new WebSocketServer({ server: httpServer });
 
@@ -248,23 +305,64 @@ wss.on("connection", (twilioWs, req) => {
     }
   }
 
-  let speaking = false;
+  // ----- BARGE-IN STATE -----
+  let speechToken = 0; // increments on user speech_started
+  let currentSpeech = null; // { token, abortController }
+
+  function cancelSpeech(reason) {
+    if (!currentSpeech) return;
+    try {
+      currentSpeech.abortController.abort();
+    } catch {}
+    console.log(`[${new Date().toISOString()}] Speech cancelled reason=${reason}`);
+    currentSpeech = null;
+  }
+
+  function twilioClear() {
+    if (twilioWs.readyState !== WebSocket.OPEN || !streamSid) return;
+    twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
+  }
+
   async function speak(text) {
     const t = (text || "").trim();
     if (!t) return;
-    if (speaking) return;
     if (!streamSid) return;
 
-    speaking = true;
+    // one active speech at a time
+    if (currentSpeech) return;
+
+    const myToken = speechToken;
+    const abortController = new AbortController();
+    currentSpeech = { token: myToken, abortController };
+
     const t0 = Date.now();
-    console.log(`[${new Date().toISOString()}] SPEAK_START text="${t.slice(0, 120)}"`);
+    console.log(`[${new Date().toISOString()}] SPEAK_START text="${t.slice(0, 140)}"`);
+
     try {
-      await elevenStreamToUlaw(t, pushUlaw);
+      await elevenStreamToUlaw(t, (chunk) => {
+        // Stop pushing frames if user barged in
+        if (speechToken !== myToken) return;
+        if (abortController.signal.aborted) return;
+        pushUlaw(chunk);
+      }, abortController.signal);
+
+      // If token changed mid-speech, treat as cancelled
+      if (speechToken !== myToken) {
+        return;
+      }
+
       console.log(`[${new Date().toISOString()}] SPEAK_DONE ms=${Date.now() - t0}`);
     } catch (e) {
+      if (abortController.signal.aborted) {
+        // cancelled on purpose
+        return;
+      }
       console.error("❌ SPEAK_ERROR:", e.message);
     } finally {
-      speaking = false;
+      // Only clear if this speech is still "current"
+      if (currentSpeech && currentSpeech.token === myToken) {
+        currentSpeech = null;
+      }
     }
   }
 
@@ -328,12 +426,13 @@ wss.on("connection", (twilioWs, req) => {
 
     if (msg.event === "stop") {
       console.log(`[${new Date().toISOString()}] Twilio stop streamSid=${streamSid}`);
+      cancelSpeech("twilio_stop");
       if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
       return;
     }
   });
 
-  // OpenAI -> speak assistant text (single pass)
+  // OpenAI -> speak assistant text (with barge-in)
   let assistantBuf = "";
   let assistantSeen = false;
   let lastSpokenText = "";
@@ -347,9 +446,14 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     if (evt.type === "input_audio_buffer.speech_started") {
-      console.log(`[${new Date().toISOString()}] 🎙️ speech_started`);
+      console.log(`[${new Date().toISOString()}] 🎙️ speech_started (barge-in)`);
+      // user started talking -> stop any current speech immediately
+      speechToken++;
+      cancelSpeech("barge_in");
+      twilioClear();
       return;
     }
+
     if (evt.type === "input_audio_buffer.speech_stopped") {
       console.log(`[${new Date().toISOString()}] 🎙️ speech_stopped`);
       return;
@@ -387,6 +491,7 @@ wss.on("connection", (twilioWs, req) => {
 
   openaiWs.on("close", (code) => {
     console.log(`[${new Date().toISOString()}] OpenAI WS closed code=${code}`);
+    cancelSpeech("openai_ws_close");
     if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
   });
 
@@ -396,15 +501,17 @@ wss.on("connection", (twilioWs, req) => {
 
   twilioWs.on("close", () => {
     console.log(`[${new Date().toISOString()}] Twilio WS closed streamSid=${streamSid}`);
+    cancelSpeech("twilio_ws_close");
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
 
   twilioWs.on("error", (e) => {
     console.error(`[${new Date().toISOString()}] Twilio WS error:`, e.message);
+    cancelSpeech("twilio_ws_error");
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
 });
 
 httpServer.listen(PORT, () => {
-  console.log(`✅ DES inbound: greeting + STT + 1 reply via Eleven live on ${PORT}`);
+  console.log(`✅ DES inbound: greeting + STT + reply via Eleven + barge-in live on ${PORT}`);
 });
