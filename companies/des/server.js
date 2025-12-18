@@ -30,6 +30,9 @@ const HANGUP_DELAY_MS = Number(process.env.HANGUP_DELAY_MS || 2500);
 // debug flag for OpenAI event types (off by default)
 const OPENAI_DEBUG_EVENTS = process.env.OPENAI_DEBUG_EVENTS === "1";
 
+// ✅ NEW: audio frame debug (off by default)
+const AUDIO_DEBUG_FRAMES = process.env.AUDIO_DEBUG_FRAMES === "1";
+
 if (!OPENAI_API_KEY) {
   console.error("❌ OPENAI_API_KEY missing");
   process.exit(1);
@@ -323,22 +326,74 @@ wss.on("connection", (twilioWs, req) => {
   let streamSid = null;
   console.log(`[${new Date().toISOString()}] WS connected url=${req.url}`);
 
+  // ✅ NEW: per-connection counters
+  const frameSize = 160;
+  let totalSentFrames = 0;
+  let totalSentBytes = 0;
+  let totalDropNoStreamSid = 0;
+  let totalDropNotOpen = 0;
+
+  // ✅ NEW: per-speak counters (reset at each speak)
+  let speakSeq = 0;
+  let currentSpeakId = null;
+  let speakSentFrames = 0;
+  let speakSentBytes = 0;
+  let speakDropNoStreamSid = 0;
+  let speakDropNotOpen = 0;
+
+  function resetSpeakCounters() {
+    speakSentFrames = 0;
+    speakSentBytes = 0;
+    speakDropNoStreamSid = 0;
+    speakDropNotOpen = 0;
+  }
+
   let ulawBuf = Buffer.alloc(0);
   function pushUlaw(chunk) {
     ulawBuf = Buffer.concat([ulawBuf, chunk]);
-    const frameSize = 160;
+
     while (ulawBuf.length >= frameSize) {
       const frame = ulawBuf.subarray(0, frameSize);
       ulawBuf = ulawBuf.subarray(frameSize);
 
-      if (twilioWs.readyState !== WebSocket.OPEN || !streamSid) return;
-      twilioWs.send(
-        JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: frame.toString("base64") },
-        })
-      );
+      if (!streamSid) {
+        totalDropNoStreamSid++;
+        speakDropNoStreamSid++;
+        continue;
+      }
+
+      if (twilioWs.readyState !== WebSocket.OPEN) {
+        totalDropNotOpen++;
+        speakDropNotOpen++;
+        continue;
+      }
+
+      try {
+        twilioWs.send(
+          JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: frame.toString("base64") },
+          })
+        );
+      } catch {
+        totalDropNotOpen++;
+        speakDropNotOpen++;
+        continue;
+      }
+
+      totalSentFrames++;
+      totalSentBytes += frameSize;
+
+      speakSentFrames++;
+      speakSentBytes += frameSize;
+
+      // Optional: very sparse frame debug
+      if (AUDIO_DEBUG_FRAMES && speakSentFrames % 50 === 0 && currentSpeakId) {
+        console.log(
+          `[${new Date().toISOString()}] AUDIO_PROGRESS speak=${currentSpeakId} sentFrames=${speakSentFrames} sentBytes=${speakSentBytes} dropNoSid=${speakDropNoStreamSid} dropNotOpen=${speakDropNotOpen}`
+        );
+      }
     }
   }
 
@@ -465,10 +520,19 @@ wss.on("connection", (twilioWs, req) => {
     const tTail = t.slice(Math.max(0, tLen - tailLen));
     const hasToken = t.includes(HANGUP_TOKEN);
 
+    const mySpeakId = `${Date.now()}_${++speakSeq}`;
+    currentSpeakId = mySpeakId;
+    resetSpeakCounters();
+
     const t0 = Date.now();
     console.log(
       `[${new Date().toISOString()}] SPEAK_START chars=${tLen} sha1=${tHash} hasToken=${hasToken} tail="${tTail}"`
     );
+    if (AUDIO_DEBUG_FRAMES) {
+      console.log(
+        `[${new Date().toISOString()}] AUDIO_SPEAK_BEGIN speak=${mySpeakId} streamSid=${streamSid}`
+      );
+    }
 
     try {
       await elevenStreamToUlaw(
@@ -487,6 +551,11 @@ wss.on("connection", (twilioWs, req) => {
         `[${new Date().toISOString()}] SPEAK_DONE ms=${Date.now() - t0} chars=${tLen} sha1=${tHash} hasToken=${hasToken}`
       );
 
+      // ✅ NEW: per-speak summary
+      console.log(
+        `[${new Date().toISOString()}] AUDIO_SPEAK_SUMMARY speak=${mySpeakId} sentFrames=${speakSentFrames} sentBytes=${speakSentBytes} dropNoSid=${speakDropNoStreamSid} dropNotOpen=${speakDropNotOpen}`
+      );
+
       if (hasToken) {
         armHangup("token_seen");
       }
@@ -497,6 +566,7 @@ wss.on("connection", (twilioWs, req) => {
       if (currentSpeech && currentSpeech.token === myToken) {
         currentSpeech = null;
       }
+      currentSpeakId = null;
     }
   }
 
@@ -586,6 +656,12 @@ wss.on("connection", (twilioWs, req) => {
 
     if (msg.event === "stop") {
       console.log(`[${new Date().toISOString()}] Twilio stop streamSid=${streamSid}`);
+
+      // ✅ NEW: per-call summary on stop
+      console.log(
+        `[${new Date().toISOString()}] AUDIO_CALL_SUMMARY sentFrames=${totalSentFrames} sentBytes=${totalSentBytes} dropNoSid=${totalDropNoStreamSid} dropNotOpen=${totalDropNotOpen}`
+      );
+
       disarmHangup("twilio_stop");
       cancelSpeech("twilio_stop");
       if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
@@ -593,7 +669,7 @@ wss.on("connection", (twilioWs, req) => {
     }
   });
 
-  // OpenAI -> speak assistant text
+  // OpenAI -> speak assistant text (speak on response.done)
   let assistantBuf = "";
   let assistantSeen = false;
 
@@ -606,11 +682,11 @@ wss.on("connection", (twilioWs, req) => {
 
   let spokenForThisTurn = false;
 
-  // per-call debug counter (reset on connect)
+  // per-call debug counter
   let openaiDebugCount = 0;
   const OPENAI_DEBUG_LIMIT = 200;
 
-  // ✅ NEW: wait for response.done; audio_transcript.done only starts a short failsafe timer
+  // wait for response.done; audio_transcript.done only starts a short failsafe timer
   let pendingResponseDoneTimer = null;
   const RESPONSE_DONE_FAILSAFE_MS = 200;
 
@@ -705,7 +781,6 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    // ✅ CHANGE: don't speak here; just arm a short failsafe in case response.done never arrives
     if (evt.type === "response.audio_transcript.done") {
       if (!assistantSeen && !textSeen) return;
 
@@ -717,7 +792,6 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    // ✅ NEW: speak on response.done (this comes after content_part.done/output_item.done in your logs)
     if (evt.type === "response.done") {
       if (!assistantSeen && !textSeen) return;
       maybeSpeakFromBuffers("response.done");
@@ -743,6 +817,12 @@ wss.on("connection", (twilioWs, req) => {
 
   twilioWs.on("close", () => {
     console.log(`[${new Date().toISOString()}] Twilio WS closed streamSid=${streamSid}`);
+
+    // per-call summary on close
+    console.log(
+      `[${new Date().toISOString()}] AUDIO_CALL_SUMMARY sentFrames=${totalSentFrames} sentBytes=${totalSentBytes} dropNoSid=${totalDropNoStreamSid} dropNotOpen=${totalDropNotOpen}`
+    );
+
     disarmHangup("twilio_ws_close");
     cancelSpeech("twilio_ws_close");
     clearPendingResponseDoneTimer();
