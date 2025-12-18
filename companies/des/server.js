@@ -27,12 +27,6 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const HANGUP_TOKEN = process.env.HANGUP_TOKEN || "AFRONDEN_OK";
 const HANGUP_DELAY_MS = Number(process.env.HANGUP_DELAY_MS || 2500);
 
-// debug flag for OpenAI event types (off by default)
-const OPENAI_DEBUG_EVENTS = process.env.OPENAI_DEBUG_EVENTS === "1";
-
-// audio frame debug (off by default)
-const AUDIO_DEBUG_FRAMES = process.env.AUDIO_DEBUG_FRAMES === "1";
-
 if (!OPENAI_API_KEY) {
   console.error("❌ OPENAI_API_KEY missing");
   process.exit(1);
@@ -326,110 +320,22 @@ wss.on("connection", (twilioWs, req) => {
   let streamSid = null;
   console.log(`[${new Date().toISOString()}] WS connected url=${req.url}`);
 
-  // per-connection counters
-  const frameSize = 160;
-  let totalSentFrames = 0;
-  let totalSentBytes = 0;
-  let totalDropNoStreamSid = 0;
-  let totalDropNotOpen = 0;
-
-  // ✅ NEW: backpressure counters (per-connection)
-  let totalSendErrors = 0;
-  let totalMaxSendCbLagMs = 0;
-  let totalPendingSendCb = 0;
-
-  // per-speak counters
-  let speakSeq = 0;
-  let currentSpeakId = null;
-  let speakSentFrames = 0;
-  let speakSentBytes = 0;
-  let speakDropNoStreamSid = 0;
-  let speakDropNotOpen = 0;
-
-  // ✅ NEW: backpressure counters (per-speak)
-  let speakSendErrors = 0;
-  let speakMaxSendCbLagMs = 0;
-  let speakPendingSendCb = 0;
-
-  function resetSpeakCounters() {
-    speakSentFrames = 0;
-    speakSentBytes = 0;
-    speakDropNoStreamSid = 0;
-    speakDropNotOpen = 0;
-
-    speakSendErrors = 0;
-    speakMaxSendCbLagMs = 0;
-    speakPendingSendCb = 0;
-  }
-
   let ulawBuf = Buffer.alloc(0);
   function pushUlaw(chunk) {
     ulawBuf = Buffer.concat([ulawBuf, chunk]);
-
+    const frameSize = 160;
     while (ulawBuf.length >= frameSize) {
       const frame = ulawBuf.subarray(0, frameSize);
       ulawBuf = ulawBuf.subarray(frameSize);
 
-      if (!streamSid) {
-        totalDropNoStreamSid++;
-        speakDropNoStreamSid++;
-        continue;
-      }
-
-      if (twilioWs.readyState !== WebSocket.OPEN) {
-        totalDropNotOpen++;
-        speakDropNotOpen++;
-        continue;
-      }
-
-      const payload = JSON.stringify({
-        event: "media",
-        streamSid,
-        media: { payload: frame.toString("base64") },
-      });
-
-      const tSend0 = Date.now();
-      totalPendingSendCb++;
-      speakPendingSendCb++;
-      try {
-        twilioWs.send(payload, (err) => {
-          const lag = Date.now() - tSend0;
-
-          totalPendingSendCb = Math.max(0, totalPendingSendCb - 1);
-          speakPendingSendCb = Math.max(0, speakPendingSendCb - 1);
-
-          if (lag > totalMaxSendCbLagMs) totalMaxSendCbLagMs = lag;
-          if (lag > speakMaxSendCbLagMs) speakMaxSendCbLagMs = lag;
-
-          if (err) {
-            totalSendErrors++;
-            speakSendErrors++;
-          }
-        });
-      } catch {
-        // send threw synchronously
-        totalPendingSendCb = Math.max(0, totalPendingSendCb - 1);
-        speakPendingSendCb = Math.max(0, speakPendingSendCb - 1);
-
-        totalSendErrors++;
-        speakSendErrors++;
-        totalDropNotOpen++;
-        speakDropNotOpen++;
-        continue;
-      }
-
-      totalSentFrames++;
-      totalSentBytes += frameSize;
-
-      speakSentFrames++;
-      speakSentBytes += frameSize;
-
-      // Optional: very sparse debug
-      if (AUDIO_DEBUG_FRAMES && speakSentFrames % 50 === 0 && currentSpeakId) {
-        console.log(
-          `[${new Date().toISOString()}] AUDIO_PROGRESS speak=${currentSpeakId} sentFrames=${speakSentFrames} sentBytes=${speakSentBytes} dropNoSid=${speakDropNoStreamSid} dropNotOpen=${speakDropNotOpen} sendErrors=${speakSendErrors} maxSendCbLagMs=${speakMaxSendCbLagMs} pendingSendCb=${speakPendingSendCb}`
-        );
-      }
+      if (twilioWs.readyState !== WebSocket.OPEN || !streamSid) return;
+      twilioWs.send(
+        JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: frame.toString("base64") },
+        })
+      );
     }
   }
 
@@ -540,6 +446,46 @@ wss.on("connection", (twilioWs, req) => {
     console.log(`[${new Date().toISOString()}] Hangup disarmed reason=${reason}`);
   }
 
+  const openaiWs = new WebSocket(
+    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    }
+  );
+
+  function safeOpenAI(obj) {
+    if (openaiWs.readyState === WebSocket.OPEN) openaiWs.send(JSON.stringify(obj));
+  }
+
+  // =========================
+  // FIX: Half-duplex while speaking
+  // - block Twilio->OpenAI audio while Eleven is streaming to Twilio
+  // - prevents false barge-in from echo/bleed
+  // =========================
+  let isSpeaking = false;
+  let resumeInboundTimer = null;
+  function setSpeaking(on) {
+    if (on) {
+      if (resumeInboundTimer) {
+        clearTimeout(resumeInboundTimer);
+        resumeInboundTimer = null;
+      }
+      isSpeaking = true;
+      return;
+    }
+
+    // end speaking: keep block briefly so tail/echo doesn't trigger VAD instantly
+    if (resumeInboundTimer) clearTimeout(resumeInboundTimer);
+    resumeInboundTimer = setTimeout(() => {
+      isSpeaking = false;
+      // flush any residual audio OpenAI might have buffered
+      safeOpenAI({ type: "input_audio_buffer.clear" });
+    }, 250);
+  }
+
   async function speak(text) {
     const t = (text || "").trim();
     if (!t) return;
@@ -550,25 +496,15 @@ wss.on("connection", (twilioWs, req) => {
     const abortController = new AbortController();
     currentSpeech = { token: myToken, abortController };
 
-    const tLen = t.length;
-    const tHash = sha1(t);
-    const tailLen = 80;
-    const tTail = t.slice(Math.max(0, tLen - tailLen));
-    const hasToken = t.includes(HANGUP_TOKEN);
-
-    const mySpeakId = `${Date.now()}_${++speakSeq}`;
-    currentSpeakId = mySpeakId;
-    resetSpeakCounters();
-
     const t0 = Date.now();
+    const h = sha1(t);
+    const hasToken = t.includes(HANGUP_TOKEN);
+    const tail = t.length > 80 ? t.slice(-80) : t;
     console.log(
-      `[${new Date().toISOString()}] SPEAK_START chars=${tLen} sha1=${tHash} hasToken=${hasToken} tail="${tTail}"`
+      `[${new Date().toISOString()}] SPEAK_START chars=${t.length} sha1=${h} hasToken=${hasToken} tail="${tail}"`
     );
-    if (AUDIO_DEBUG_FRAMES) {
-      console.log(
-        `[${new Date().toISOString()}] AUDIO_SPEAK_BEGIN speak=${mySpeakId} streamSid=${streamSid}`
-      );
-    }
+
+    setSpeaking(true);
 
     try {
       await elevenStreamToUlaw(
@@ -584,12 +520,7 @@ wss.on("connection", (twilioWs, req) => {
       if (speechToken !== myToken) return;
 
       console.log(
-        `[${new Date().toISOString()}] SPEAK_DONE ms=${Date.now() - t0} chars=${tLen} sha1=${tHash} hasToken=${hasToken}`
-      );
-
-      // per-speak summary
-      console.log(
-        `[${new Date().toISOString()}] AUDIO_SPEAK_SUMMARY speak=${mySpeakId} sentFrames=${speakSentFrames} sentBytes=${speakSentBytes} dropNoSid=${speakDropNoStreamSid} dropNotOpen=${speakDropNotOpen} sendErrors=${speakSendErrors} maxSendCbLagMs=${speakMaxSendCbLagMs} pendingSendCb=${speakPendingSendCb}`
+        `[${new Date().toISOString()}] SPEAK_DONE ms=${Date.now() - t0} chars=${t.length} sha1=${h} hasToken=${hasToken}`
       );
 
       if (hasToken) {
@@ -599,25 +530,11 @@ wss.on("connection", (twilioWs, req) => {
       if (abortController.signal.aborted) return;
       console.error("❌ SPEAK_ERROR:", e.message);
     } finally {
+      setSpeaking(false);
       if (currentSpeech && currentSpeech.token === myToken) {
         currentSpeech = null;
       }
-      currentSpeakId = null;
     }
-  }
-
-  const openaiWs = new WebSocket(
-    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1",
-      },
-    }
-  );
-
-  function safeOpenAI(obj) {
-    if (openaiWs.readyState === WebSocket.OPEN) openaiWs.send(JSON.stringify(obj));
   }
 
   openaiWs.on("open", () => {
@@ -672,6 +589,8 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     if (msg.event === "media") {
+      // FIX: block inbound while Tessa is speaking
+      if (isSpeaking) return;
       safeOpenAI({ type: "input_audio_buffer.append", audio: msg.media.payload });
       return;
     }
@@ -692,12 +611,6 @@ wss.on("connection", (twilioWs, req) => {
 
     if (msg.event === "stop") {
       console.log(`[${new Date().toISOString()}] Twilio stop streamSid=${streamSid}`);
-
-      // per-call summary on stop
-      console.log(
-        `[${new Date().toISOString()}] AUDIO_CALL_SUMMARY sentFrames=${totalSentFrames} sentBytes=${totalSentBytes} dropNoSid=${totalDropNoStreamSid} dropNotOpen=${totalDropNotOpen} sendErrors=${totalSendErrors} maxSendCbLagMs=${totalMaxSendCbLagMs} pendingSendCb=${totalPendingSendCb}`
-      );
-
       disarmHangup("twilio_stop");
       cancelSpeech("twilio_stop");
       if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
@@ -705,7 +618,7 @@ wss.on("connection", (twilioWs, req) => {
     }
   });
 
-  // OpenAI -> speak assistant text (speak on response.done)
+  // OpenAI -> speak assistant text
   let assistantBuf = "";
   let assistantSeen = false;
 
@@ -717,21 +630,6 @@ wss.on("connection", (twilioWs, req) => {
   const DEDUPE_WINDOW_MS = 5000;
 
   let spokenForThisTurn = false;
-
-  // per-call debug counter
-  let openaiDebugCount = 0;
-  const OPENAI_DEBUG_LIMIT = 200;
-
-  // wait for response.done; audio_transcript.done only starts a short failsafe timer
-  let pendingResponseDoneTimer = null;
-  const RESPONSE_DONE_FAILSAFE_MS = 200;
-
-  function clearPendingResponseDoneTimer() {
-    if (pendingResponseDoneTimer) {
-      clearTimeout(pendingResponseDoneTimer);
-      pendingResponseDoneTimer = null;
-    }
-  }
 
   function maybeSpeakFromBuffers(trigger) {
     if (spokenForThisTurn) return;
@@ -754,8 +652,6 @@ wss.on("connection", (twilioWs, req) => {
     textBuf = "";
     textSeen = false;
 
-    clearPendingResponseDoneTimer();
-
     speak(combined).catch(() => {});
     console.log(`[${new Date().toISOString()}] SPEAK_TRIGGERED via=${trigger}`);
   }
@@ -768,13 +664,7 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    if (
-      OPENAI_DEBUG_EVENTS &&
-      typeof evt?.type === "string" &&
-      evt.type.startsWith("response.") &&
-      openaiDebugCount < OPENAI_DEBUG_LIMIT
-    ) {
-      openaiDebugCount++;
+    if (evt?.type) {
       console.log(`[${new Date().toISOString()}] OPENAI_EVT type=${evt.type}`);
     }
 
@@ -790,7 +680,6 @@ wss.on("connection", (twilioWs, req) => {
       assistantSeen = false;
       textBuf = "";
       textSeen = false;
-      clearPendingResponseDoneTimer();
 
       return;
     }
@@ -819,12 +708,14 @@ wss.on("connection", (twilioWs, req) => {
 
     if (evt.type === "response.audio_transcript.done") {
       if (!assistantSeen && !textSeen) return;
+      // we prefer to wait for response.done (later), but keep behavior: allow trigger here
+      maybeSpeakFromBuffers("audio_transcript.done");
+      return;
+    }
 
-      clearPendingResponseDoneTimer();
-      pendingResponseDoneTimer = setTimeout(() => {
-        maybeSpeakFromBuffers("audio_transcript.done_failsafe");
-      }, RESPONSE_DONE_FAILSAFE_MS);
-
+    if (evt.type === "response.text.done") {
+      if (!assistantSeen && !textSeen) return;
+      maybeSpeakFromBuffers("text.done");
       return;
     }
 
@@ -843,7 +734,6 @@ wss.on("connection", (twilioWs, req) => {
     console.log(`[${new Date().toISOString()}] OpenAI WS closed code=${code}`);
     disarmHangup("openai_ws_close");
     cancelSpeech("openai_ws_close");
-    clearPendingResponseDoneTimer();
     if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
   });
 
@@ -853,15 +743,8 @@ wss.on("connection", (twilioWs, req) => {
 
   twilioWs.on("close", () => {
     console.log(`[${new Date().toISOString()}] Twilio WS closed streamSid=${streamSid}`);
-
-    // per-call summary on close
-    console.log(
-      `[${new Date().toISOString()}] AUDIO_CALL_SUMMARY sentFrames=${totalSentFrames} sentBytes=${totalSentBytes} dropNoSid=${totalDropNoStreamSid} dropNotOpen=${totalDropNotOpen} sendErrors=${totalSendErrors} maxSendCbLagMs=${totalMaxSendCbLagMs} pendingSendCb=${totalPendingSendCb}`
-    );
-
     disarmHangup("twilio_ws_close");
     cancelSpeech("twilio_ws_close");
-    clearPendingResponseDoneTimer();
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
 
@@ -869,7 +752,6 @@ wss.on("connection", (twilioWs, req) => {
     console.error(`[${new Date().toISOString()}] Twilio WS error:`, e.message);
     disarmHangup("twilio_ws_error");
     cancelSpeech("twilio_ws_error");
-    clearPendingResponseDoneTimer();
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
 });
