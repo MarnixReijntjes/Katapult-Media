@@ -27,7 +27,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const HANGUP_TOKEN = process.env.HANGUP_TOKEN || "AFRONDEN_OK";
 const HANGUP_DELAY_MS = Number(process.env.HANGUP_DELAY_MS || 2500);
 
-// ✅ NEW: debug flag for OpenAI event types (off by default)
+// debug flag for OpenAI event types (off by default)
 const OPENAI_DEBUG_EVENTS = process.env.OPENAI_DEBUG_EVENTS === "1";
 
 if (!OPENAI_API_KEY) {
@@ -187,7 +187,7 @@ async function elevenStreamToUlaw(text, onUlawChunk, abortSignal) {
   if (!res.ok) {
     const err = await res.text().catch(() => "");
     cleanup();
-    throw new Error(`ELEVEN_STREAM_FAILED ${resp.status}: ${err}`);
+    throw new Error(`ELEVEN_STREAM_FAILED ${res.status}: ${err}`);
   }
 
   const nodeStream = Readable.fromWeb(res.body);
@@ -606,9 +606,20 @@ wss.on("connection", (twilioWs, req) => {
 
   let spokenForThisTurn = false;
 
-  // ✅ NEW: per-call debug counter (reset on connect)
+  // per-call debug counter (reset on connect)
   let openaiDebugCount = 0;
   const OPENAI_DEBUG_LIMIT = 200;
+
+  // ✅ NEW: wait for response.done; audio_transcript.done only starts a short failsafe timer
+  let pendingResponseDoneTimer = null;
+  const RESPONSE_DONE_FAILSAFE_MS = 200;
+
+  function clearPendingResponseDoneTimer() {
+    if (pendingResponseDoneTimer) {
+      clearTimeout(pendingResponseDoneTimer);
+      pendingResponseDoneTimer = null;
+    }
+  }
 
   function maybeSpeakFromBuffers(trigger) {
     if (spokenForThisTurn) return;
@@ -631,6 +642,8 @@ wss.on("connection", (twilioWs, req) => {
     textBuf = "";
     textSeen = false;
 
+    clearPendingResponseDoneTimer();
+
     speak(combined).catch(() => {});
     console.log(`[${new Date().toISOString()}] SPEAK_TRIGGERED via=${trigger}`);
   }
@@ -643,7 +656,6 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    // ✅ NEW: log which response.* events are actually received
     if (
       OPENAI_DEBUG_EVENTS &&
       typeof evt?.type === "string" &&
@@ -651,9 +663,7 @@ wss.on("connection", (twilioWs, req) => {
       openaiDebugCount < OPENAI_DEBUG_LIMIT
     ) {
       openaiDebugCount++;
-      console.log(
-        `[${new Date().toISOString()}] OPENAI_EVT type=${evt.type}`
-      );
+      console.log(`[${new Date().toISOString()}] OPENAI_EVT type=${evt.type}`);
     }
 
     if (evt.type === "input_audio_buffer.speech_started") {
@@ -668,6 +678,7 @@ wss.on("connection", (twilioWs, req) => {
       assistantSeen = false;
       textBuf = "";
       textSeen = false;
+      clearPendingResponseDoneTimer();
 
       return;
     }
@@ -694,15 +705,22 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
+    // ✅ CHANGE: don't speak here; just arm a short failsafe in case response.done never arrives
     if (evt.type === "response.audio_transcript.done") {
       if (!assistantSeen && !textSeen) return;
-      maybeSpeakFromBuffers("audio_transcript.done");
+
+      clearPendingResponseDoneTimer();
+      pendingResponseDoneTimer = setTimeout(() => {
+        maybeSpeakFromBuffers("audio_transcript.done_failsafe");
+      }, RESPONSE_DONE_FAILSAFE_MS);
+
       return;
     }
 
-    if (evt.type === "response.text.done") {
+    // ✅ NEW: speak on response.done (this comes after content_part.done/output_item.done in your logs)
+    if (evt.type === "response.done") {
       if (!assistantSeen && !textSeen) return;
-      maybeSpeakFromBuffers("text.done");
+      maybeSpeakFromBuffers("response.done");
       return;
     }
 
@@ -715,6 +733,7 @@ wss.on("connection", (twilioWs, req) => {
     console.log(`[${new Date().toISOString()}] OpenAI WS closed code=${code}`);
     disarmHangup("openai_ws_close");
     cancelSpeech("openai_ws_close");
+    clearPendingResponseDoneTimer();
     if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
   });
 
@@ -726,6 +745,7 @@ wss.on("connection", (twilioWs, req) => {
     console.log(`[${new Date().toISOString()}] Twilio WS closed streamSid=${streamSid}`);
     disarmHangup("twilio_ws_close");
     cancelSpeech("twilio_ws_close");
+    clearPendingResponseDoneTimer();
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
 
@@ -733,6 +753,7 @@ wss.on("connection", (twilioWs, req) => {
     console.error(`[${new Date().toISOString()}] Twilio WS error:`, e.message);
     disarmHangup("twilio_ws_error");
     cancelSpeech("twilio_ws_error");
+    clearPendingResponseDoneTimer();
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
 });
