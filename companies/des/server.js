@@ -27,6 +27,9 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const HANGUP_TOKEN = process.env.HANGUP_TOKEN || "AFRONDEN_OK";
 const HANGUP_DELAY_MS = Number(process.env.HANGUP_DELAY_MS || 2500);
 
+// ✅ NEW: debug flag for OpenAI event types (off by default)
+const OPENAI_DEBUG_EVENTS = process.env.OPENAI_DEBUG_EVENTS === "1";
+
 if (!OPENAI_API_KEY) {
   console.error("❌ OPENAI_API_KEY missing");
   process.exit(1);
@@ -184,7 +187,7 @@ async function elevenStreamToUlaw(text, onUlawChunk, abortSignal) {
   if (!res.ok) {
     const err = await res.text().catch(() => "");
     cleanup();
-    throw new Error(`ELEVEN_STREAM_FAILED ${res.status}: ${err}`);
+    throw new Error(`ELEVEN_STREAM_FAILED ${resp.status}: ${err}`);
   }
 
   const nodeStream = Readable.fromWeb(res.body);
@@ -456,7 +459,6 @@ wss.on("connection", (twilioWs, req) => {
     const abortController = new AbortController();
     currentSpeech = { token: myToken, abortController };
 
-    // ✅ CHANGE: log full-length + tail (instead of first 140 chars only)
     const tLen = t.length;
     const tHash = sha1(t);
     const tailLen = 80;
@@ -604,6 +606,10 @@ wss.on("connection", (twilioWs, req) => {
 
   let spokenForThisTurn = false;
 
+  // ✅ NEW: per-call debug counter (reset on connect)
+  let openaiDebugCount = 0;
+  const OPENAI_DEBUG_LIMIT = 200;
+
   function maybeSpeakFromBuffers(trigger) {
     if (spokenForThisTurn) return;
 
@@ -635,6 +641,19 @@ wss.on("connection", (twilioWs, req) => {
       evt = JSON.parse(raw);
     } catch {
       return;
+    }
+
+    // ✅ NEW: log which response.* events are actually received
+    if (
+      OPENAI_DEBUG_EVENTS &&
+      typeof evt?.type === "string" &&
+      evt.type.startsWith("response.") &&
+      openaiDebugCount < OPENAI_DEBUG_LIMIT
+    ) {
+      openaiDebugCount++;
+      console.log(
+        `[${new Date().toISOString()}] OPENAI_EVT type=${evt.type}`
+      );
     }
 
     if (evt.type === "input_audio_buffer.speech_started") {
