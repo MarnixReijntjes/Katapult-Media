@@ -24,7 +24,6 @@ const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL || "eleven_multilingual_v2";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// ✅ Hangup config (was missing in your current file)
 const HANGUP_TOKEN = process.env.HANGUP_TOKEN || "AFRONDEN_OK";
 const HANGUP_DELAY_MS = Number(process.env.HANGUP_DELAY_MS || 2500);
 
@@ -62,7 +61,6 @@ function sha1(s) {
 
 /* =========================
    ElevenLabs greeting cache (mp3 for <Play>)
-   IMPORTANT: Twilio webhook must return fast.
 ========================= */
 let cachedMp3 = null;
 let cachedText = null;
@@ -118,7 +116,6 @@ async function warmGreetingCache() {
 
 /* =========================
    ElevenLabs streaming -> ffmpeg -> ulaw bytes callback
-   Supports AbortController for barge-in
 ========================= */
 async function elevenStreamToUlaw(text, onUlawChunk, abortSignal) {
   const ff = spawn("ffmpeg", [
@@ -235,9 +232,6 @@ async function elevenStreamToUlaw(text, onUlawChunk, abortSignal) {
 
 /* =========================
    HTTP (TwiML + audio)
-   Key fix:
-   - If greeting mp3 not cached yet, DO NOT block Twilio webhook.
-   - Return TwiML immediately and let WS play greeting.
 ========================= */
 const httpServer = http.createServer(async (req, res) => {
   try {
@@ -255,7 +249,6 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/twiml" && req.method === "POST") {
       console.log(`[${new Date().toISOString()}] TwiML hit method=POST url=/twiml`);
 
-      // refresh cache if greeting changed or older than 1h
       const now = Date.now();
       const cacheValid =
         cachedMp3 &&
@@ -263,15 +256,12 @@ const httpServer = http.createServer(async (req, res) => {
         now - cachedAt < 60 * 60 * 1000;
 
       if (!cacheValid) {
-        // Start warming in background; DO NOT await (Twilio needs fast response)
         warmGreetingCache().catch(() => {});
       }
 
       const baseUrl = `https://${req.headers.host}`;
       const wsUrl = `wss://${req.headers.host}/ws`;
 
-      // If cached mp3 is available -> Play + Stream.
-      // Else -> Stream only; greeting will be spoken via WS when stream starts.
       let twiml = "";
       if (cacheValid) {
         const audioUrl = `${baseUrl}/audio.mp3?ts=${Date.now()}`;
@@ -318,10 +308,6 @@ const httpServer = http.createServer(async (req, res) => {
 
 /* =========================
    WebSockets: Twilio -> OpenAI -> Eleven -> Twilio
-   - barge-in
-   - anti-double: speak only on response.audio_transcript.done
-   - NEW: if TwiML was stream-only (no mp3 cache), we speak greeting via WS on start.
-   - ✅ FIX: hangup token handling (MARK-gated + delay + fallback)
 ========================= */
 const wss = new WebSocketServer({ server: httpServer });
 
@@ -334,7 +320,6 @@ wss.on("connection", (twilioWs, req) => {
   let streamSid = null;
   console.log(`[${new Date().toISOString()}] WS connected url=${req.url}`);
 
-  // ulaw frame packing: 20ms @ 8kHz mono = 160 bytes
   let ulawBuf = Buffer.alloc(0);
   function pushUlaw(chunk) {
     ulawBuf = Buffer.concat([ulawBuf, chunk]);
@@ -354,7 +339,6 @@ wss.on("connection", (twilioWs, req) => {
     }
   }
 
-  // ----- BARGE-IN STATE -----
   let speechToken = 0;
   let currentSpeech = null; // { token, abortController }
   let greetingSpokenViaWs = false;
@@ -373,7 +357,7 @@ wss.on("connection", (twilioWs, req) => {
     twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
   }
 
-  // ===== Hangup state (MARK-gated) =====
+  // Hangup state
   let hangupTimer = null;
   let pendingHangupMarkName = null;
   let hangupFailSafeTimer = null;
@@ -421,7 +405,6 @@ wss.on("connection", (twilioWs, req) => {
   }
 
   function armHangup(reason) {
-    // cancel any existing hangup
     if (hangupTimer) {
       clearTimeout(hangupTimer);
       hangupTimer = null;
@@ -437,7 +420,6 @@ wss.on("connection", (twilioWs, req) => {
         `[${new Date().toISOString()}] Hangup armed via MARK name=${name} reason=${reason}`
       );
 
-      // Fail-safe: fallback to old behavior if no MARK ack
       const FAILSAFE_MS = Math.max(8000, HANGUP_DELAY_MS + 3000);
       hangupFailSafeTimer = setTimeout(() => {
         console.log(
@@ -463,7 +445,6 @@ wss.on("connection", (twilioWs, req) => {
     cleanupHangupMark(reason);
     console.log(`[${new Date().toISOString()}] Hangup disarmed reason=${reason}`);
   }
-  // ===== END hangup state =====
 
   async function speak(text) {
     const t = (text || "").trim();
@@ -493,7 +474,6 @@ wss.on("connection", (twilioWs, req) => {
 
       console.log(`[${new Date().toISOString()}] SPEAK_DONE ms=${Date.now() - t0}`);
 
-      // ✅ If assistant ended with token, hang up (after mark ack + delay)
       if (t.includes(HANGUP_TOKEN)) {
         armHangup("token_seen");
       }
@@ -558,7 +538,6 @@ wss.on("connection", (twilioWs, req) => {
         `[${new Date().toISOString()}] Twilio start streamSid=${streamSid} callSid=${msg.start?.callSid}`
       );
 
-      // If TwiML used Stream-only (cache was missing), we must greet via WS.
       const now = Date.now();
       const cacheValid =
         cachedMp3 &&
@@ -602,13 +581,45 @@ wss.on("connection", (twilioWs, req) => {
   });
 
   // OpenAI -> speak assistant text
+  // CHANGE: also support response.text.* because audio_transcript.* can be incomplete
   let assistantBuf = "";
   let assistantSeen = false;
 
-  // Anti-double: speak only on transcript.done + hash dedupe (short window)
+  let textBuf = "";
+  let textSeen = false;
+
   let lastSpokenHash = "";
   let lastSpokenAt = 0;
   const DEDUPE_WINDOW_MS = 5000;
+
+  // Guard to prevent speaking twice on both done events
+  let spokenForThisTurn = false;
+
+  function maybeSpeakFromBuffers(trigger) {
+    if (spokenForThisTurn) return;
+
+    const combined = (assistantBuf.trim() || textBuf.trim()).trim();
+    if (!combined) return;
+
+    const now = Date.now();
+    const h = sha1(combined);
+    const isDup = h === lastSpokenHash && now - lastSpokenAt < DEDUPE_WINDOW_MS;
+    if (isDup) return;
+
+    lastSpokenHash = h;
+    lastSpokenAt = now;
+
+    spokenForThisTurn = true;
+
+    // reset buffers for next turn
+    assistantBuf = "";
+    assistantSeen = false;
+    textBuf = "";
+    textSeen = false;
+
+    speak(combined).catch(() => {});
+    console.log(`[${new Date().toISOString()}] SPEAK_TRIGGERED via=${trigger}`);
+  }
 
   openaiWs.on("message", async (raw) => {
     let evt;
@@ -624,6 +635,14 @@ wss.on("connection", (twilioWs, req) => {
       speechToken++;
       cancelSpeech("barge_in");
       twilioClear();
+
+      // new user turn begins: allow next assistant speak
+      spokenForThisTurn = false;
+      assistantBuf = "";
+      assistantSeen = false;
+      textBuf = "";
+      textSeen = false;
+
       return;
     }
 
@@ -643,23 +662,21 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    // ✅ Speak ONLY here (anti-double)
+    if (evt.type === "response.text.delta" && typeof evt.delta === "string") {
+      textSeen = true;
+      textBuf += evt.delta;
+      return;
+    }
+
     if (evt.type === "response.audio_transcript.done") {
-      if (!assistantSeen) return;
+      if (!assistantSeen && !textSeen) return;
+      maybeSpeakFromBuffers("audio_transcript.done");
+      return;
+    }
 
-      const text = assistantBuf.trim();
-      assistantBuf = "";
-      assistantSeen = false;
-
-      const now = Date.now();
-      const h = sha1(text);
-      const isDup = h === lastSpokenHash && now - lastSpokenAt < DEDUPE_WINDOW_MS;
-      if (!text || isDup) return;
-
-      lastSpokenHash = h;
-      lastSpokenAt = now;
-
-      await speak(text);
+    if (evt.type === "response.text.done") {
+      if (!assistantSeen && !textSeen) return;
+      maybeSpeakFromBuffers("text.done");
       return;
     }
 
@@ -701,6 +718,5 @@ httpServer.listen(PORT, () => {
   console.log(
     `✅ DES inbound live on ${PORT} (Eleven greeting mp3-cache + Stream fallback + OpenAI reply + barge-in + anti-double + hangup-token)`
   );
-  // Warm immediately so first inbound call answers fast.
   warmGreetingCache().catch(() => {});
 });
