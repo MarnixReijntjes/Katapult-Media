@@ -8,6 +8,9 @@ import crypto from "crypto";
 
 dotenv.config();
 
+/* =======================
+   CONFIG
+======================= */
 const PORT = process.env.PORT || 10000;
 
 const INBOUND_GREETING = process.env.INBOUND_GREETING || "Hoi, met Tessa van DES.";
@@ -20,6 +23,7 @@ const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL || "eleven_multilingual_v2";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
 if (!OPENAI_API_KEY) {
   console.error("❌ OPENAI_API_KEY missing");
   process.exit(1);
@@ -29,6 +33,9 @@ if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
   process.exit(1);
 }
 
+/* =======================
+   HELPERS
+======================= */
 function sendXml(res, xml) {
   res.writeHead(200, { "Content-Type": "text/xml; charset=utf-8" });
   res.end(xml);
@@ -51,10 +58,12 @@ function sha1(s) {
 
 /* =========================
    ElevenLabs greeting cache (mp3 for <Play>)
+   IMPORTANT: Twilio webhook must return fast.
 ========================= */
 let cachedMp3 = null;
 let cachedText = null;
 let cachedAt = 0;
+let warming = false;
 
 async function synthesizeElevenMp3(text) {
   const resp = await fetch(
@@ -82,6 +91,25 @@ async function synthesizeElevenMp3(text) {
   const buf = Buffer.from(await resp.arrayBuffer());
   if (!buf.length) throw new Error("ELEVEN_EMPTY_AUDIO");
   return buf;
+}
+
+async function warmGreetingCache() {
+  if (warming) return;
+  warming = true;
+  try {
+    const t0 = Date.now();
+    const mp3 = await synthesizeElevenMp3(INBOUND_GREETING);
+    cachedMp3 = mp3;
+    cachedText = INBOUND_GREETING;
+    cachedAt = Date.now();
+    console.log(
+      `[${new Date().toISOString()}] 🔥 Warmed greeting cache bytes=${mp3.length} ms=${Date.now() - t0}`
+    );
+  } catch (e) {
+    console.error(`[${new Date().toISOString()}] ❌ Warm greeting failed:`, e.message);
+  } finally {
+    warming = false;
+  }
 }
 
 /* =========================
@@ -203,6 +231,9 @@ async function elevenStreamToUlaw(text, onUlawChunk, abortSignal) {
 
 /* =========================
    HTTP (TwiML + audio)
+   Key fix:
+   - If greeting mp3 not cached yet, DO NOT block Twilio webhook.
+   - Return TwiML immediately and let WS play greeting.
 ========================= */
 const httpServer = http.createServer(async (req, res) => {
   try {
@@ -218,8 +249,9 @@ const httpServer = http.createServer(async (req, res) => {
     }
 
     if (path === "/twiml" && req.method === "POST") {
-      console.log(`[${new Date().toISOString()}] TwiML hit`);
+      console.log(`[${new Date().toISOString()}] TwiML hit method=POST url=/twiml`);
 
+      // refresh cache if greeting changed or older than 1h
       const now = Date.now();
       const cacheValid =
         cachedMp3 &&
@@ -227,32 +259,40 @@ const httpServer = http.createServer(async (req, res) => {
         now - cachedAt < 60 * 60 * 1000;
 
       if (!cacheValid) {
-        const t0 = Date.now();
-        cachedMp3 = await synthesizeElevenMp3(INBOUND_GREETING);
-        cachedText = INBOUND_GREETING;
-        cachedAt = Date.now();
-        console.log(
-          `[${new Date().toISOString()}] ✅ Eleven greeting bytes=${cachedMp3.length} ms=${Date.now() - t0}`
-        );
-      } else {
-        console.log(`[${new Date().toISOString()}] ♻️ Using cached greeting mp3`);
+        // Start warming in background; DO NOT await (Twilio needs fast response)
+        warmGreetingCache().catch(() => {});
       }
 
       const baseUrl = `https://${req.headers.host}`;
-      const audioUrl = `${baseUrl}/audio.mp3?ts=${Date.now()}`;
       const wsUrl = `wss://${req.headers.host}/ws`;
 
-      const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+      // If cached mp3 is available -> Play + Stream.
+      // Else -> Stream only; greeting will be spoken via WS when stream starts.
+      let twiml = "";
+      if (cacheValid) {
+        const audioUrl = `${baseUrl}/audio.mp3?ts=${Date.now()}`;
+        twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${escapeXml(audioUrl)}</Play>
   <Connect>
     <Stream url="${escapeXml(wsUrl)}" />
   </Connect>
 </Response>`;
+        console.log(
+          `[${new Date().toISOString()}] TwiML served <Play> + <Stream> ws=${wsUrl}`
+        );
+      } else {
+        twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="${escapeXml(wsUrl)}" />
+  </Connect>
+</Response>`;
+        console.log(
+          `[${new Date().toISOString()}] TwiML served <Stream-only> (cache warming) ws=${wsUrl}`
+        );
+      }
 
-      console.log(
-        `[${new Date().toISOString()}] TwiML served <Play> + <Stream> ws=${wsUrl}`
-      );
       return sendXml(res, twiml);
     }
 
@@ -276,6 +316,7 @@ const httpServer = http.createServer(async (req, res) => {
    WebSockets: Twilio -> OpenAI -> Eleven -> Twilio
    - barge-in
    - anti-double: speak only on response.audio_transcript.done
+   - NEW: if TwiML was stream-only (no mp3 cache), we speak greeting via WS on start.
 ========================= */
 const wss = new WebSocketServer({ server: httpServer });
 
@@ -311,6 +352,7 @@ wss.on("connection", (twilioWs, req) => {
   // ----- BARGE-IN STATE -----
   let speechToken = 0;
   let currentSpeech = null; // { token, abortController }
+  let greetingSpokenViaWs = false;
 
   function cancelSpeech(reason) {
     if (!currentSpeech) return;
@@ -413,6 +455,19 @@ wss.on("connection", (twilioWs, req) => {
       console.log(
         `[${new Date().toISOString()}] Twilio start streamSid=${streamSid} callSid=${msg.start?.callSid}`
       );
+
+      // If TwiML used Stream-only (cache was missing), we must greet via WS.
+      const now = Date.now();
+      const cacheValid =
+        cachedMp3 &&
+        cachedText === INBOUND_GREETING &&
+        now - cachedAt < 60 * 60 * 1000;
+
+      if (!cacheValid && !greetingSpokenViaWs) {
+        greetingSpokenViaWs = true;
+        speak(INBOUND_GREETING).catch(() => {});
+      }
+
       return;
     }
 
@@ -490,8 +545,6 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    // response.done is intentionally ignored to prevent duplicates
-
     if (evt.type === "error") {
       console.error(`[${new Date().toISOString()}] ❌ OpenAI error:`, JSON.stringify(evt.error));
     }
@@ -520,6 +573,13 @@ wss.on("connection", (twilioWs, req) => {
   });
 });
 
+/* =======================
+   START
+======================= */
 httpServer.listen(PORT, () => {
-  console.log(`✅ DES inbound: greeting + STT + reply via Eleven + barge-in + anti-double live on ${PORT}`);
+  console.log(
+    `✅ DES inbound live on ${PORT} (Eleven greeting mp3-cache + Stream fallback + OpenAI reply + barge-in + anti-double)`
+  );
+  // Warm immediately so first inbound call answers fast.
+  warmGreetingCache().catch(() => {});
 });
