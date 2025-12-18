@@ -30,7 +30,7 @@ const HANGUP_DELAY_MS = Number(process.env.HANGUP_DELAY_MS || 2500);
 // debug flag for OpenAI event types (off by default)
 const OPENAI_DEBUG_EVENTS = process.env.OPENAI_DEBUG_EVENTS === "1";
 
-// ✅ NEW: audio frame debug (off by default)
+// audio frame debug (off by default)
 const AUDIO_DEBUG_FRAMES = process.env.AUDIO_DEBUG_FRAMES === "1";
 
 if (!OPENAI_API_KEY) {
@@ -326,14 +326,19 @@ wss.on("connection", (twilioWs, req) => {
   let streamSid = null;
   console.log(`[${new Date().toISOString()}] WS connected url=${req.url}`);
 
-  // ✅ NEW: per-connection counters
+  // per-connection counters
   const frameSize = 160;
   let totalSentFrames = 0;
   let totalSentBytes = 0;
   let totalDropNoStreamSid = 0;
   let totalDropNotOpen = 0;
 
-  // ✅ NEW: per-speak counters (reset at each speak)
+  // ✅ NEW: backpressure counters (per-connection)
+  let totalSendErrors = 0;
+  let totalMaxSendCbLagMs = 0;
+  let totalPendingSendCb = 0;
+
+  // per-speak counters
   let speakSeq = 0;
   let currentSpeakId = null;
   let speakSentFrames = 0;
@@ -341,11 +346,20 @@ wss.on("connection", (twilioWs, req) => {
   let speakDropNoStreamSid = 0;
   let speakDropNotOpen = 0;
 
+  // ✅ NEW: backpressure counters (per-speak)
+  let speakSendErrors = 0;
+  let speakMaxSendCbLagMs = 0;
+  let speakPendingSendCb = 0;
+
   function resetSpeakCounters() {
     speakSentFrames = 0;
     speakSentBytes = 0;
     speakDropNoStreamSid = 0;
     speakDropNotOpen = 0;
+
+    speakSendErrors = 0;
+    speakMaxSendCbLagMs = 0;
+    speakPendingSendCb = 0;
   }
 
   let ulawBuf = Buffer.alloc(0);
@@ -368,15 +382,37 @@ wss.on("connection", (twilioWs, req) => {
         continue;
       }
 
+      const payload = JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload: frame.toString("base64") },
+      });
+
+      const tSend0 = Date.now();
+      totalPendingSendCb++;
+      speakPendingSendCb++;
       try {
-        twilioWs.send(
-          JSON.stringify({
-            event: "media",
-            streamSid,
-            media: { payload: frame.toString("base64") },
-          })
-        );
+        twilioWs.send(payload, (err) => {
+          const lag = Date.now() - tSend0;
+
+          totalPendingSendCb = Math.max(0, totalPendingSendCb - 1);
+          speakPendingSendCb = Math.max(0, speakPendingSendCb - 1);
+
+          if (lag > totalMaxSendCbLagMs) totalMaxSendCbLagMs = lag;
+          if (lag > speakMaxSendCbLagMs) speakMaxSendCbLagMs = lag;
+
+          if (err) {
+            totalSendErrors++;
+            speakSendErrors++;
+          }
+        });
       } catch {
+        // send threw synchronously
+        totalPendingSendCb = Math.max(0, totalPendingSendCb - 1);
+        speakPendingSendCb = Math.max(0, speakPendingSendCb - 1);
+
+        totalSendErrors++;
+        speakSendErrors++;
         totalDropNotOpen++;
         speakDropNotOpen++;
         continue;
@@ -388,10 +424,10 @@ wss.on("connection", (twilioWs, req) => {
       speakSentFrames++;
       speakSentBytes += frameSize;
 
-      // Optional: very sparse frame debug
+      // Optional: very sparse debug
       if (AUDIO_DEBUG_FRAMES && speakSentFrames % 50 === 0 && currentSpeakId) {
         console.log(
-          `[${new Date().toISOString()}] AUDIO_PROGRESS speak=${currentSpeakId} sentFrames=${speakSentFrames} sentBytes=${speakSentBytes} dropNoSid=${speakDropNoStreamSid} dropNotOpen=${speakDropNotOpen}`
+          `[${new Date().toISOString()}] AUDIO_PROGRESS speak=${currentSpeakId} sentFrames=${speakSentFrames} sentBytes=${speakSentBytes} dropNoSid=${speakDropNoStreamSid} dropNotOpen=${speakDropNotOpen} sendErrors=${speakSendErrors} maxSendCbLagMs=${speakMaxSendCbLagMs} pendingSendCb=${speakPendingSendCb}`
         );
       }
     }
@@ -551,9 +587,9 @@ wss.on("connection", (twilioWs, req) => {
         `[${new Date().toISOString()}] SPEAK_DONE ms=${Date.now() - t0} chars=${tLen} sha1=${tHash} hasToken=${hasToken}`
       );
 
-      // ✅ NEW: per-speak summary
+      // per-speak summary
       console.log(
-        `[${new Date().toISOString()}] AUDIO_SPEAK_SUMMARY speak=${mySpeakId} sentFrames=${speakSentFrames} sentBytes=${speakSentBytes} dropNoSid=${speakDropNoStreamSid} dropNotOpen=${speakDropNotOpen}`
+        `[${new Date().toISOString()}] AUDIO_SPEAK_SUMMARY speak=${mySpeakId} sentFrames=${speakSentFrames} sentBytes=${speakSentBytes} dropNoSid=${speakDropNoStreamSid} dropNotOpen=${speakDropNotOpen} sendErrors=${speakSendErrors} maxSendCbLagMs=${speakMaxSendCbLagMs} pendingSendCb=${speakPendingSendCb}`
       );
 
       if (hasToken) {
@@ -657,9 +693,9 @@ wss.on("connection", (twilioWs, req) => {
     if (msg.event === "stop") {
       console.log(`[${new Date().toISOString()}] Twilio stop streamSid=${streamSid}`);
 
-      // ✅ NEW: per-call summary on stop
+      // per-call summary on stop
       console.log(
-        `[${new Date().toISOString()}] AUDIO_CALL_SUMMARY sentFrames=${totalSentFrames} sentBytes=${totalSentBytes} dropNoSid=${totalDropNoStreamSid} dropNotOpen=${totalDropNotOpen}`
+        `[${new Date().toISOString()}] AUDIO_CALL_SUMMARY sentFrames=${totalSentFrames} sentBytes=${totalSentBytes} dropNoSid=${totalDropNoStreamSid} dropNotOpen=${totalDropNotOpen} sendErrors=${totalSendErrors} maxSendCbLagMs=${totalMaxSendCbLagMs} pendingSendCb=${totalPendingSendCb}`
       );
 
       disarmHangup("twilio_stop");
@@ -820,7 +856,7 @@ wss.on("connection", (twilioWs, req) => {
 
     // per-call summary on close
     console.log(
-      `[${new Date().toISOString()}] AUDIO_CALL_SUMMARY sentFrames=${totalSentFrames} sentBytes=${totalSentBytes} dropNoSid=${totalDropNoStreamSid} dropNotOpen=${totalDropNotOpen}`
+      `[${new Date().toISOString()}] AUDIO_CALL_SUMMARY sentFrames=${totalSentFrames} sentBytes=${totalSentBytes} dropNoSid=${totalDropNoStreamSid} dropNotOpen=${totalDropNotOpen} sendErrors=${totalSendErrors} maxSendCbLagMs=${totalMaxSendCbLagMs} pendingSendCb=${totalPendingSendCb}`
     );
 
     disarmHangup("twilio_ws_close");
