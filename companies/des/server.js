@@ -27,8 +27,12 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const HANGUP_TOKEN = process.env.HANGUP_TOKEN || "AFRONDEN_OK";
 const HANGUP_DELAY_MS = Number(process.env.HANGUP_DELAY_MS || 2500);
 
-// NEW: barge-in debounce window (echo/noise)
+// barge-in debounce window (echo/noise)
 const BARGE_IN_IGNORE_MS = Number(process.env.BARGE_IN_IGNORE_MS || 600);
+
+// NEW: while Tessa speaks, do not forward caller audio to OpenAI (prevents echo/false barge-in)
+const MUTE_STT_WHILE_SPEAKING =
+  String(process.env.MUTE_STT_WHILE_SPEAKING || "1") !== "0";
 
 if (!OPENAI_API_KEY) {
   console.error("❌ OPENAI_API_KEY missing");
@@ -248,7 +252,7 @@ const httpServer = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         ok: true,
         service:
-          "des-inbound-eleven-greeting-openai-reply-barge-in-debounce-dedupe-commit-on-success",
+          "des-inbound-eleven-greeting-openai-reply-barge-in-debounce-dedupe-commit-on-success-mute-stt-while-speaking",
         ts: nowIso(),
       });
     }
@@ -330,7 +334,7 @@ wss.on("connection", (twilioWs, req) => {
   let currentSpeech = null; // { token, abortController, dedupeHash, startedAt }
   let greetingSpokenViaWs = false;
 
-  // NEW: timestamp of last speak start (for debounce)
+  // timestamp of last speak start (for debounce)
   let lastSpeakStartAt = 0;
 
   function cancelSpeech(reason) {
@@ -450,7 +454,7 @@ wss.on("connection", (twilioWs, req) => {
     const myToken = speechToken;
     const abortController = new AbortController();
 
-    // NEW: store dedupe hash but only commit it on successful completion
+    // store dedupe hash but only commit it on successful completion
     const dedupeHash = typeof opts.dedupeHash === "string" ? opts.dedupeHash : "";
 
     currentSpeech = {
@@ -550,7 +554,7 @@ wss.on("connection", (twilioWs, req) => {
         )} hasToken=${t.includes(HANGUP_TOKEN)}`
       );
 
-      // NEW: commit dedupe only if completed (no abort)
+      // commit dedupe only if completed (no abort)
       if (dedupeHash) {
         lastSpokenHash = dedupeHash;
         lastSpokenAt = Date.now();
@@ -570,7 +574,6 @@ wss.on("connection", (twilioWs, req) => {
       }
       speakStats = null;
 
-      // If we didn't complete, do NOT update dedupe, and clear currentSpeech
       if (currentSpeech && currentSpeech.token === myToken) {
         currentSpeech = null;
       }
@@ -595,7 +598,7 @@ wss.on("connection", (twilioWs, req) => {
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.send(JSON.stringify(obj));
   }
 
-  // NEW: track whether there is an active response before sending response.cancel
+  // track whether there is an active response before sending response.cancel
   let openaiResponseActive = false;
 
   openaiWs.on("open", () => {
@@ -650,6 +653,9 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     if (msg.event === "media") {
+      // ✅ CHANGE: while speaking, do not forward audio to OpenAI (prevents echo-triggered barge-in)
+      if (MUTE_STT_WHILE_SPEAKING && currentSpeech) return;
+
       safeOpenAI({ type: "input_audio_buffer.append", audio: msg.media.payload });
       return;
     }
@@ -690,7 +696,6 @@ wss.on("connection", (twilioWs, req) => {
     const combined = (textBuf.trim() || assistantBuf.trim()).trim();
     if (!combined) return;
 
-    // Check dedupe based on last successfully completed speech
     const now = Date.now();
     const h = sha1(combined);
     const isDup = h === lastSpokenHash && now - lastSpokenAt < DEDUPE_WINDOW_MS;
@@ -698,7 +703,6 @@ wss.on("connection", (twilioWs, req) => {
 
     spokenForThisResponse = true;
 
-    // IMPORTANT: pass dedupeHash but it will only commit when SPEAK completes
     speak(combined, { dedupeHash: h }).catch(() => {});
     console.log(`[${nowIso()}] SPEAK_TRIGGERED via=${trigger}`);
   }
@@ -724,7 +728,6 @@ wss.on("connection", (twilioWs, req) => {
       console.log(`[${nowIso()}] OPENAI_EVT type=${evt.type}`);
     }
 
-    // track response active state
     if (evt.type === "response.created") {
       openaiResponseActive = true;
       return;
@@ -745,13 +748,13 @@ wss.on("connection", (twilioWs, req) => {
     if (evt.type === "input_audio_buffer.speech_started") {
       console.log(`[${nowIso()}] 🎙️ speech_started (barge-in)`);
 
-      // NEW: only treat as barge-in when we are actually speaking
+      // only treat as barge-in when we are actually speaking
       if (!currentSpeech) {
         console.log(`[${nowIso()}] BARGE_IN_IGNORED (not speaking)`);
         return;
       }
 
-      // NEW: debounce early VAD triggers (echo/noise)
+      // debounce early VAD triggers (echo/noise)
       const sinceSpeakStart = Date.now() - lastSpeakStartAt;
       if (sinceSpeakStart >= 0 && sinceSpeakStart < BARGE_IN_IGNORE_MS) {
         console.log(
@@ -760,7 +763,6 @@ wss.on("connection", (twilioWs, req) => {
         return;
       }
 
-      // cancel only if there is an active response
       if (openaiResponseActive) {
         safeOpenAI({ type: "response.cancel" });
       } else {
@@ -799,7 +801,6 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     if (evt.type === "error") {
-      // keep responseActive conservative
       if (evt?.error?.code === "response_cancel_not_active") {
         openaiResponseActive = false;
       }
@@ -839,7 +840,7 @@ wss.on("connection", (twilioWs, req) => {
 ======================= */
 httpServer.listen(PORT, () => {
   console.log(
-    `✅ DES inbound live on ${PORT} (barge-in debounce=${BARGE_IN_IGNORE_MS}ms, dedupe commit on successful speak, cancel only if active)`
+    `✅ DES inbound live on ${PORT} (barge-in debounce=${BARGE_IN_IGNORE_MS}ms, mute_stt_while_speaking=${MUTE_STT_WHILE_SPEAKING ? "on" : "off"})`
   );
   warmGreetingCache().catch(() => {});
 });
