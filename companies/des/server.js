@@ -244,8 +244,7 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/health") {
       return sendJson(res, 200, {
         ok: true,
-        service:
-          "des-inbound-eleven-greeting-openai-reply-barge-in-anti-late-response",
+        service: "des-inbound-eleven-openai-rt-paced-audio",
         ts: nowIso(),
       });
     }
@@ -259,9 +258,7 @@ const httpServer = http.createServer(async (req, res) => {
         cachedText === INBOUND_GREETING &&
         now - cachedAt < 60 * 60 * 1000;
 
-      if (!cacheValid) {
-        warmGreetingCache().catch(() => {});
-      }
+      if (!cacheValid) warmGreetingCache().catch(() => {});
 
       const baseUrl = `https://${req.headers.host}`;
       const wsUrl = `wss://${req.headers.host}/ws`;
@@ -322,40 +319,109 @@ wss.on("connection", (twilioWs, req) => {
   let streamSid = null;
   console.log(`[${nowIso()}] WS connected url=${req.url}`);
 
-  // ----- BARGE-IN STATE -----
+  /* =========================
+     REALTIME PACED OUTPUT (fixes Twilio buffering “old audio returns”)
+     20ms @ 8kHz mono = 160 bytes
+  ========================= */
+  const FRAME_SIZE = 160;
+  const FRAME_MS = 20;
+
+  let outQueue = []; // array of Buffers (160 bytes each)
+  let senderTimer = null;
+  let senderNextAt = 0;
+
+  function enqueueFrame(frame) {
+    outQueue.push(frame);
+  }
+
+  function flushOutQueue(reason) {
+    outQueue = [];
+    if (reason) console.log(`[${nowIso()}] OUTQ_FLUSH reason=${reason}`);
+  }
+
+  function senderStart() {
+    if (senderTimer) return;
+    senderNextAt = Date.now();
+
+    const tick = () => {
+      if (!senderTimer) return;
+
+      const now = Date.now();
+      if (now < senderNextAt) {
+        senderTimer = setTimeout(tick, senderNextAt - now);
+        return;
+      }
+
+      senderNextAt += FRAME_MS;
+
+      if (twilioWs.readyState !== WebSocket.OPEN || !streamSid) {
+        senderTimer = setTimeout(tick, FRAME_MS);
+        return;
+      }
+
+      const frame = outQueue.shift();
+      if (frame) {
+        try {
+          twilioWs.send(
+            JSON.stringify({
+              event: "media",
+              streamSid,
+              media: { payload: frame.toString("base64") },
+            })
+          );
+        } catch {}
+      }
+
+      senderTimer = setTimeout(tick, Math.max(0, senderNextAt - Date.now()));
+    };
+
+    senderTimer = setTimeout(tick, 0);
+  }
+
+  function senderStop() {
+    if (senderTimer) {
+      clearTimeout(senderTimer);
+      senderTimer = null;
+    }
+  }
+
+  // make sure sender is running during the call
+  senderStart();
+
+  /* =========================
+     BARGE-IN STATE
+  ========================= */
   let speechToken = 0;
   let currentSpeech = null; // { token, abortController }
   let greetingSpokenViaWs = false;
 
-  // Turn/response correlation (fixes late deltas)
-  let turnSeq = 0;
-  const responseTurnById = new Map(); // response_id -> turnSeq
-  let lastResponseId = null;
-
-  // OpenAI response activity guard (fixes response_cancel_not_active spam)
+  // OpenAI cancel guard
   let openaiResponseActive = false;
-
-  // ulaw frame packing: 20ms @ 8kHz mono = 160 bytes
-  // (keep these for completeness; we also reset them hard on barge-in)
-  let ulawBuf = Buffer.alloc(0);
 
   function cancelSpeech(reason) {
     if (!currentSpeech) return;
     try {
       currentSpeech.abortController.abort();
     } catch {}
-    console.log(`[${nowIso()}] Speech cancelled reason=${reason}`);
     currentSpeech = null;
+
+    // crucial: stop queued audio immediately
+    flushOutQueue(`cancelSpeech:${reason}`);
+
+    console.log(`[${nowIso()}] Speech cancelled reason=${reason}`);
   }
 
   function twilioClear() {
     if (twilioWs.readyState !== WebSocket.OPEN || !streamSid) return;
     try {
+      // 1) clear Twilio buffer
       twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
+      // 2) also clear our own outgoing queue
+      flushOutQueue("twilioClear");
     } catch {}
   }
 
-  // Hangup state
+  // Hangup state (unchanged)
   let hangupTimer = null;
   let pendingHangupMarkName = null;
   let hangupFailSafeTimer = null;
@@ -367,9 +433,7 @@ wss.on("connection", (twilioWs, req) => {
       clearTimeout(hangupFailSafeTimer);
       hangupFailSafeTimer = null;
     }
-    if (reason) {
-      console.log(`[${nowIso()}] Hangup mark cleared reason=${reason}`);
-    }
+    if (reason) console.log(`[${nowIso()}] Hangup mark cleared reason=${reason}`);
   }
 
   function startHangupCountdown(reason) {
@@ -387,13 +451,7 @@ wss.on("connection", (twilioWs, req) => {
   function sendMark(name) {
     if (twilioWs.readyState !== WebSocket.OPEN || !streamSid) return false;
     try {
-      twilioWs.send(
-        JSON.stringify({
-          event: "mark",
-          streamSid,
-          mark: { name },
-        })
-      );
+      twilioWs.send(JSON.stringify({ event: "mark", streamSid, mark: { name } }));
       return true;
     } catch {
       return false;
@@ -438,7 +496,7 @@ wss.on("connection", (twilioWs, req) => {
     console.log(`[${nowIso()}] Hangup disarmed reason=${reason}`);
   }
 
-  // Audio send stats per speak
+  // Speak stats (still useful)
   let speakSeq = 0;
   let speakStats = null;
 
@@ -447,7 +505,7 @@ wss.on("connection", (twilioWs, req) => {
     if (!t) return;
     if (!streamSid) return;
 
-    // KILL + REPLACE (no silence when new response arrives)
+    // Replace current audio instantly
     if (currentSpeech) {
       cancelSpeech("replace");
       twilioClear();
@@ -460,13 +518,8 @@ wss.on("connection", (twilioWs, req) => {
     const id = `${Date.now()}_${++speakSeq}`;
     speakStats = {
       id,
-      sentFrames: 0,
-      sentBytes: 0,
-      dropNoSid: 0,
-      dropNotOpen: 0,
-      sendErrors: 0,
-      maxSendCbLagMs: 0,
-      pendingSendCb: 0,
+      enqueuedFrames: 0,
+      enqueuedBytes: 0,
       startedAt: Date.now(),
       chars: t.length,
       sha1: sha1(t),
@@ -480,59 +533,33 @@ wss.on("connection", (twilioWs, req) => {
     );
 
     let ulawLocalBuf = Buffer.alloc(0);
-    const frameSize = 160;
 
-    const pushCounted = (chunk) => {
+    const pushPaced = (chunk) => {
+      // hard stop ASAP
+      if (speechToken !== myToken) return;
+      if (abortController.signal.aborted) return;
+
       ulawLocalBuf = Buffer.concat([ulawLocalBuf, chunk]);
-      while (ulawLocalBuf.length >= frameSize) {
-        const frame = ulawLocalBuf.subarray(0, frameSize);
-        ulawLocalBuf = ulawLocalBuf.subarray(frameSize);
 
-        if (!streamSid) {
-          speakStats.dropNoSid++;
-          continue;
-        }
-        if (twilioWs.readyState !== WebSocket.OPEN) {
-          speakStats.dropNotOpen++;
-          continue;
-        }
+      while (ulawLocalBuf.length >= FRAME_SIZE) {
+        if (speechToken !== myToken) return;
+        if (abortController.signal.aborted) return;
 
-        const payload = JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: frame.toString("base64") },
-        });
+        const frame = ulawLocalBuf.subarray(0, FRAME_SIZE);
+        ulawLocalBuf = ulawLocalBuf.subarray(FRAME_SIZE);
 
-        const before = Date.now();
-        speakStats.pendingSendCb++;
-        try {
-          twilioWs.send(payload, (err) => {
-            const lag = Date.now() - before;
-            if (lag > speakStats.maxSendCbLagMs) speakStats.maxSendCbLagMs = lag;
-            speakStats.pendingSendCb--;
-            if (err) speakStats.sendErrors++;
-          });
-          speakStats.sentFrames++;
-          speakStats.sentBytes += frame.length;
-        } catch {
-          speakStats.pendingSendCb--;
-          speakStats.sendErrors++;
-        }
+        // enqueue only (pacing sender drains it)
+        enqueueFrame(frame);
+        speakStats.enqueuedFrames++;
+        speakStats.enqueuedBytes += frame.length;
       }
     };
 
     try {
-      await elevenStreamToUlaw(
-        t,
-        (chunk) => {
-          if (speechToken !== myToken) return;
-          if (abortController.signal.aborted) return;
-          pushCounted(chunk);
-        },
-        abortController.signal
-      );
+      await elevenStreamToUlaw(t, pushPaced, abortController.signal);
 
       if (speechToken !== myToken) return;
+      if (abortController.signal.aborted) return;
 
       console.log(
         `[${nowIso()}] SPEAK_DONE ms=${Date.now() - t0} chars=${t.length} sha1=${sha1(
@@ -540,23 +567,19 @@ wss.on("connection", (twilioWs, req) => {
         )} hasToken=${t.includes(HANGUP_TOKEN)}`
       );
 
-      if (t.includes(HANGUP_TOKEN)) {
-        armHangup("token_seen");
-      }
+      if (t.includes(HANGUP_TOKEN)) armHangup("token_seen");
     } catch (e) {
       if (abortController.signal.aborted) return;
       console.error("❌ SPEAK_ERROR:", e.message);
     } finally {
       if (speakStats) {
         console.log(
-          `[${nowIso()}] AUDIO_SPEAK_SUMMARY speak=${speakStats.id} sentFrames=${speakStats.sentFrames} sentBytes=${speakStats.sentBytes} dropNoSid=${speakStats.dropNoSid} dropNotOpen=${speakStats.dropNotOpen} sendErrors=${speakStats.sendErrors} maxSendCbLagMs=${speakStats.maxSendCbLagMs} pendingSendCb=${speakStats.pendingSendCb}`
+          `[${nowIso()}] AUDIO_SPEAK_SUMMARY speak=${speakStats.id} enqueuedFrames=${speakStats.enqueuedFrames} enqueuedBytes=${speakStats.enqueuedBytes}`
         );
       }
       speakStats = null;
 
-      if (currentSpeech && currentSpeech.token === myToken) {
-        currentSpeech = null;
-      }
+      if (currentSpeech && currentSpeech.token === myToken) currentSpeech = null;
     }
   }
 
@@ -621,7 +644,6 @@ wss.on("connection", (twilioWs, req) => {
         greetingSpokenViaWs = true;
         speak(INBOUND_GREETING).catch(() => {});
       }
-
       return;
     }
 
@@ -646,6 +668,7 @@ wss.on("connection", (twilioWs, req) => {
       console.log(`[${nowIso()}] Twilio stop streamSid=${streamSid}`);
       disarmHangup("twilio_stop");
       cancelSpeech("twilio_stop");
+      senderStop();
       if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
       return;
     }
@@ -658,11 +681,6 @@ wss.on("connection", (twilioWs, req) => {
   let textBuf = "";
   let textSeen = false;
 
-  // Anti-double dedupe
-  let lastSpokenHash = "";
-  let lastSpokenAt = 0;
-  const DEDUPE_WINDOW_MS = 5000;
-
   let spokenForThisResponse = false;
 
   function resetAssistantBuffers(reason) {
@@ -674,49 +692,18 @@ wss.on("connection", (twilioWs, req) => {
     if (reason) console.log(`[${nowIso()}] ASSISTANT_RESET reason=${reason}`);
   }
 
-  function isEventForCurrentTurn(evt) {
-    // If we can detect response_id, enforce turn matching
-    const rid =
-      evt.response_id ||
-      evt.response?.id ||
-      evt?.response?.response_id ||
-      null;
-
-    if (rid) {
-      lastResponseId = rid;
-      const t = responseTurnById.get(rid);
-      if (t == null) {
-        // unknown response id: assume current turn (safe default)
-        responseTurnById.set(rid, turnSeq);
-        return true;
-      }
-      return t === turnSeq;
-    }
-
-    // If no response id present, we can't hard-filter; allow
-    return true;
-  }
-
   function maybeSpeakFromBuffers(trigger) {
     if (spokenForThisResponse) return;
 
     const combined = (textBuf.trim() || assistantBuf.trim()).trim();
     if (!combined) return;
 
-    const now = Date.now();
-    const h = sha1(combined);
-    const isDup = h === lastSpokenHash && now - lastSpokenAt < DEDUPE_WINDOW_MS;
-    if (isDup) return;
-
-    lastSpokenHash = h;
-    lastSpokenAt = now;
-
     spokenForThisResponse = true;
     speak(combined).catch(() => {});
     console.log(`[${nowIso()}] SPEAK_TRIGGERED via=${trigger}`);
   }
 
-  openaiWs.on("message", async (raw) => {
+  openaiWs.on("message", (raw) => {
     let evt;
     try {
       evt = JSON.parse(raw);
@@ -724,40 +711,22 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    if (evt?.type) {
-      console.log(`[${nowIso()}] OPENAI_EVT type=${evt.type}`);
-    }
+    if (evt?.type) console.log(`[${nowIso()}] OPENAI_EVT type=${evt.type}`);
 
-    // HARD BARGE-IN
     if (evt.type === "input_audio_buffer.speech_started") {
       console.log(`[${nowIso()}] 🎙️ speech_started (barge-in)`);
-
-      // new turn begins
-      turnSeq++;
-      responseTurnById.clear();
-      lastResponseId = null;
 
       disarmHangup("barge_in");
       speechToken++;
 
-      // stop any ongoing output immediately
+      // kill audio HARD + clear buffers
       cancelSpeech("barge_in");
       twilioClear();
 
-      // hard reset buffers (both counted/local + global)
-      ulawBuf = Buffer.alloc(0);
-
-      // cancel OpenAI only if active (prevents response_cancel_not_active)
-      if (openaiResponseActive) {
-        safeOpenAI({ type: "response.cancel" });
-      }
+      // cancel OpenAI only if active (avoid response_cancel_not_active spam)
+      if (openaiResponseActive) safeOpenAI({ type: "response.cancel" });
 
       resetAssistantBuffers("barge_in");
-      return;
-    }
-
-    if (evt.type === "input_audio_buffer.speech_stopped") {
-      console.log(`[${nowIso()}] 🎙️ speech_stopped`);
       return;
     }
 
@@ -766,25 +735,9 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    // Response lifecycle flags
     if (evt.type === "response.created") {
       openaiResponseActive = true;
-
-      const rid = evt.response?.id || evt.response_id || null;
-      if (rid) {
-        responseTurnById.set(rid, turnSeq);
-        lastResponseId = rid;
-      }
-      // new response => allow 1 speak
       spokenForThisResponse = false;
-      return;
-    }
-
-    // Drop late output from previous turns/responses
-    if (
-      evt.type?.startsWith("response.") &&
-      !isEventForCurrentTurn(evt)
-    ) {
       return;
     }
 
@@ -823,6 +776,7 @@ wss.on("connection", (twilioWs, req) => {
     openaiResponseActive = false;
     disarmHangup("openai_ws_close");
     cancelSpeech("openai_ws_close");
+    senderStop();
     if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
   });
 
@@ -834,6 +788,8 @@ wss.on("connection", (twilioWs, req) => {
     console.log(`[${nowIso()}] Twilio WS closed streamSid=${streamSid}`);
     disarmHangup("twilio_ws_close");
     cancelSpeech("twilio_ws_close");
+    senderStop();
+    flushOutQueue("twilio_ws_close");
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
 
@@ -841,6 +797,8 @@ wss.on("connection", (twilioWs, req) => {
     console.error(`[${nowIso()}] Twilio WS error:`, e.message);
     disarmHangup("twilio_ws_error");
     cancelSpeech("twilio_ws_error");
+    senderStop();
+    flushOutQueue("twilio_ws_error");
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
 });
@@ -850,7 +808,7 @@ wss.on("connection", (twilioWs, req) => {
 ======================= */
 httpServer.listen(PORT, () => {
   console.log(
-    `✅ DES inbound live on ${PORT} (greeting mp3-cache + Stream fallback + OpenAI realtime + hard barge-in + ignore-late-responses + kill+replace speak + hangup-token)`
+    `✅ DES inbound live on ${PORT} (Eleven->ffmpeg ulaw + paced 20ms frames + hard flush on barge-in)`
   );
   warmGreetingCache().catch(() => {});
 });
