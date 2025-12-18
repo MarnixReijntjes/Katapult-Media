@@ -58,6 +58,9 @@ function escapeXml(s) {
 function sha1(s) {
   return crypto.createHash("sha1").update(String(s)).digest("hex");
 }
+function nowIso() {
+  return new Date().toISOString();
+}
 
 /* =========================
    ElevenLabs greeting cache (mp3 for <Play>)
@@ -105,10 +108,10 @@ async function warmGreetingCache() {
     cachedText = INBOUND_GREETING;
     cachedAt = Date.now();
     console.log(
-      `[${new Date().toISOString()}] 🔥 Warmed greeting cache bytes=${mp3.length} ms=${Date.now() - t0}`
+      `[${nowIso()}] 🔥 Warmed greeting cache bytes=${mp3.length} ms=${Date.now() - t0}`
     );
   } catch (e) {
-    console.error(`[${new Date().toISOString()}] ❌ Warm greeting failed:`, e.message);
+    console.error(`[${nowIso()}] ❌ Warm greeting failed:`, e.message);
   } finally {
     warming = false;
   }
@@ -241,13 +244,14 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/health") {
       return sendJson(res, 200, {
         ok: true,
-        service: "des-inbound-eleven-greeting-openai-reply-barge-in-anti-double",
-        ts: new Date().toISOString(),
+        service:
+          "des-inbound-eleven-greeting-openai-reply-barge-in-anti-double-hangup-token",
+        ts: nowIso(),
       });
     }
 
     if (path === "/twiml" && req.method === "POST") {
-      console.log(`[${new Date().toISOString()}] TwiML hit method=POST url=/twiml`);
+      console.log(`[${nowIso()}] TwiML hit method=POST url=/twiml`);
 
       const now = Date.now();
       const cacheValid =
@@ -272,9 +276,7 @@ const httpServer = http.createServer(async (req, res) => {
     <Stream url="${escapeXml(wsUrl)}" />
   </Connect>
 </Response>`;
-        console.log(
-          `[${new Date().toISOString()}] TwiML served <Play> + <Stream> ws=${wsUrl}`
-        );
+        console.log(`[${nowIso()}] TwiML served <Play> + <Stream> ws=${wsUrl}`);
       } else {
         twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -283,7 +285,7 @@ const httpServer = http.createServer(async (req, res) => {
   </Connect>
 </Response>`;
         console.log(
-          `[${new Date().toISOString()}] TwiML served <Stream-only> (cache warming) ws=${wsUrl}`
+          `[${nowIso()}] TwiML served <Stream-only> (cache warming) ws=${wsUrl}`
         );
       }
 
@@ -318,8 +320,9 @@ wss.on("connection", (twilioWs, req) => {
   }
 
   let streamSid = null;
-  console.log(`[${new Date().toISOString()}] WS connected url=${req.url}`);
+  console.log(`[${nowIso()}] WS connected url=${req.url}`);
 
+  // ulaw frame packing: 20ms @ 8kHz mono = 160 bytes
   let ulawBuf = Buffer.alloc(0);
   function pushUlaw(chunk) {
     ulawBuf = Buffer.concat([ulawBuf, chunk]);
@@ -339,6 +342,7 @@ wss.on("connection", (twilioWs, req) => {
     }
   }
 
+  // ----- BARGE-IN STATE -----
   let speechToken = 0;
   let currentSpeech = null; // { token, abortController }
   let greetingSpokenViaWs = false;
@@ -348,7 +352,7 @@ wss.on("connection", (twilioWs, req) => {
     try {
       currentSpeech.abortController.abort();
     } catch {}
-    console.log(`[${new Date().toISOString()}] Speech cancelled reason=${reason}`);
+    console.log(`[${nowIso()}] Speech cancelled reason=${reason}`);
     currentSpeech = null;
   }
 
@@ -370,22 +374,20 @@ wss.on("connection", (twilioWs, req) => {
       hangupFailSafeTimer = null;
     }
     if (reason) {
-      console.log(`[${new Date().toISOString()}] Hangup mark cleared reason=${reason}`);
+      console.log(`[${nowIso()}] Hangup mark cleared reason=${reason}`);
     }
   }
 
   function startHangupCountdown(reason) {
     if (hangupTimer) clearTimeout(hangupTimer);
     hangupTimer = setTimeout(() => {
-      console.log(`[${new Date().toISOString()}] Hanging up reason=${reason}`);
+      console.log(`[${nowIso()}] Hanging up reason=${reason}`);
       try {
         twilioWs.close();
       } catch {}
     }, HANGUP_DELAY_MS);
 
-    console.log(
-      `[${new Date().toISOString()}] Hangup armed in ${HANGUP_DELAY_MS}ms reason=${reason}`
-    );
+    console.log(`[${nowIso()}] Hangup armed in ${HANGUP_DELAY_MS}ms reason=${reason}`);
   }
 
   function sendMark(name) {
@@ -416,22 +418,18 @@ wss.on("connection", (twilioWs, req) => {
 
     if (ok) {
       pendingHangupMarkName = name;
-      console.log(
-        `[${new Date().toISOString()}] Hangup armed via MARK name=${name} reason=${reason}`
-      );
+      console.log(`[${nowIso()}] Hangup armed via MARK name=${name} reason=${reason}`);
 
       const FAILSAFE_MS = Math.max(8000, HANGUP_DELAY_MS + 3000);
       hangupFailSafeTimer = setTimeout(() => {
         console.log(
-          `[${new Date().toISOString()}] Hangup MARK timeout -> fallback name=${name} reason=${reason}`
+          `[${nowIso()}] Hangup MARK timeout -> fallback name=${name} reason=${reason}`
         );
         cleanupHangupMark("mark_timeout");
         startHangupCountdown("token_seen_fallback");
       }, FAILSAFE_MS);
     } else {
-      console.log(
-        `[${new Date().toISOString()}] Hangup mark send failed -> fallback reason=${reason}`
-      );
+      console.log(`[${nowIso()}] Hangup mark send failed -> fallback reason=${reason}`);
       cleanupHangupMark("mark_send_failed");
       startHangupCountdown("token_seen_fallback_send_failed");
     }
@@ -443,7 +441,123 @@ wss.on("connection", (twilioWs, req) => {
       hangupTimer = null;
     }
     cleanupHangupMark(reason);
-    console.log(`[${new Date().toISOString()}] Hangup disarmed reason=${reason}`);
+    console.log(`[${nowIso()}] Hangup disarmed reason=${reason}`);
+  }
+
+  // Audio send stats per speak
+  let speakSeq = 0;
+  let speakStats = null; // { id, sentFrames, sentBytes, dropNoSid, dropNotOpen, sendErrors, maxSendCbLagMs, pendingSendCb }
+
+  async function speak(text) {
+    const t = (text || "").trim();
+    if (!t) return;
+    if (!streamSid) return;
+    if (currentSpeech) return;
+
+    const myToken = speechToken;
+    const abortController = new AbortController();
+    currentSpeech = { token: myToken, abortController };
+
+    // stats start
+    const id = `${Date.now()}_${++speakSeq}`;
+    speakStats = {
+      id,
+      sentFrames: 0,
+      sentBytes: 0,
+      dropNoSid: 0,
+      dropNotOpen: 0,
+      sendErrors: 0,
+      maxSendCbLagMs: 0,
+      pendingSendCb: 0,
+      startedAt: Date.now(),
+      chars: t.length,
+      sha1: sha1(t),
+      hasToken: t.includes(HANGUP_TOKEN),
+      tail: t.slice(Math.max(0, t.length - 90)),
+    };
+
+    const t0 = Date.now();
+    console.log(
+      `[${nowIso()}] SPEAK_START chars=${speakStats.chars} sha1=${speakStats.sha1} hasToken=${speakStats.hasToken} tail="${speakStats.tail}"`
+    );
+
+    // wrap pushUlaw to count sends per 20ms frame
+    let ulawLocalBuf = Buffer.alloc(0);
+    const frameSize = 160;
+
+    const pushCounted = (chunk) => {
+      ulawLocalBuf = Buffer.concat([ulawLocalBuf, chunk]);
+      while (ulawLocalBuf.length >= frameSize) {
+        const frame = ulawLocalBuf.subarray(0, frameSize);
+        ulawLocalBuf = ulawLocalBuf.subarray(frameSize);
+
+        if (!streamSid) {
+          speakStats.dropNoSid++;
+          continue;
+        }
+        if (twilioWs.readyState !== WebSocket.OPEN) {
+          speakStats.dropNotOpen++;
+          continue;
+        }
+
+        const payload = JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: frame.toString("base64") },
+        });
+
+        const before = Date.now();
+        speakStats.pendingSendCb++;
+        try {
+          twilioWs.send(payload, (err) => {
+            const lag = Date.now() - before;
+            if (lag > speakStats.maxSendCbLagMs) speakStats.maxSendCbLagMs = lag;
+            speakStats.pendingSendCb--;
+            if (err) speakStats.sendErrors++;
+          });
+          speakStats.sentFrames++;
+          speakStats.sentBytes += frame.length;
+        } catch {
+          speakStats.pendingSendCb--;
+          speakStats.sendErrors++;
+        }
+      }
+    };
+
+    try {
+      await elevenStreamToUlaw(
+        t,
+        (chunk) => {
+          if (speechToken !== myToken) return;
+          if (abortController.signal.aborted) return;
+          // use counted sender
+          pushCounted(chunk);
+        },
+        abortController.signal
+      );
+
+      if (speechToken !== myToken) return;
+
+      console.log(`[${nowIso()}] SPEAK_DONE ms=${Date.now() - t0} chars=${t.length} sha1=${sha1(t)} hasToken=${t.includes(HANGUP_TOKEN)}`);
+
+      if (t.includes(HANGUP_TOKEN)) {
+        armHangup("token_seen");
+      }
+    } catch (e) {
+      if (abortController.signal.aborted) return;
+      console.error("❌ SPEAK_ERROR:", e.message);
+    } finally {
+      if (speakStats) {
+        console.log(
+          `[${nowIso()}] AUDIO_SPEAK_SUMMARY speak=${speakStats.id} sentFrames=${speakStats.sentFrames} sentBytes=${speakStats.sentBytes} dropNoSid=${speakStats.dropNoSid} dropNotOpen=${speakStats.dropNotOpen} sendErrors=${speakStats.sendErrors} maxSendCbLagMs=${speakStats.maxSendCbLagMs} pendingSendCb=${speakStats.pendingSendCb}`
+        );
+      }
+      speakStats = null;
+
+      if (currentSpeech && currentSpeech.token === myToken) {
+        currentSpeech = null;
+      }
+    }
   }
 
   const openaiWs = new WebSocket(
@@ -458,83 +572,6 @@ wss.on("connection", (twilioWs, req) => {
 
   function safeOpenAI(obj) {
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.send(JSON.stringify(obj));
-  }
-
-  // =========================
-  // FIX: Half-duplex while speaking
-  // - block Twilio->OpenAI audio while Eleven is streaming to Twilio
-  // - prevents false barge-in from echo/bleed
-  // =========================
-  let isSpeaking = false;
-  let resumeInboundTimer = null;
-  function setSpeaking(on) {
-    if (on) {
-      if (resumeInboundTimer) {
-        clearTimeout(resumeInboundTimer);
-        resumeInboundTimer = null;
-      }
-      isSpeaking = true;
-      return;
-    }
-
-    // end speaking: keep block briefly so tail/echo doesn't trigger VAD instantly
-    if (resumeInboundTimer) clearTimeout(resumeInboundTimer);
-    resumeInboundTimer = setTimeout(() => {
-      isSpeaking = false;
-      // flush any residual audio OpenAI might have buffered
-      safeOpenAI({ type: "input_audio_buffer.clear" });
-    }, 250);
-  }
-
-  async function speak(text) {
-    const t = (text || "").trim();
-    if (!t) return;
-    if (!streamSid) return;
-    if (currentSpeech) return;
-
-    const myToken = speechToken;
-    const abortController = new AbortController();
-    currentSpeech = { token: myToken, abortController };
-
-    const t0 = Date.now();
-    const h = sha1(t);
-    const hasToken = t.includes(HANGUP_TOKEN);
-    const tail = t.length > 80 ? t.slice(-80) : t;
-    console.log(
-      `[${new Date().toISOString()}] SPEAK_START chars=${t.length} sha1=${h} hasToken=${hasToken} tail="${tail}"`
-    );
-
-    setSpeaking(true);
-
-    try {
-      await elevenStreamToUlaw(
-        t,
-        (chunk) => {
-          if (speechToken !== myToken) return;
-          if (abortController.signal.aborted) return;
-          pushUlaw(chunk);
-        },
-        abortController.signal
-      );
-
-      if (speechToken !== myToken) return;
-
-      console.log(
-        `[${new Date().toISOString()}] SPEAK_DONE ms=${Date.now() - t0} chars=${t.length} sha1=${h} hasToken=${hasToken}`
-      );
-
-      if (hasToken) {
-        armHangup("token_seen");
-      }
-    } catch (e) {
-      if (abortController.signal.aborted) return;
-      console.error("❌ SPEAK_ERROR:", e.message);
-    } finally {
-      setSpeaking(false);
-      if (currentSpeech && currentSpeech.token === myToken) {
-        currentSpeech = null;
-      }
-    }
   }
 
   openaiWs.on("open", () => {
@@ -556,7 +593,7 @@ wss.on("connection", (twilioWs, req) => {
         max_response_output_tokens: 250,
       },
     });
-    console.log(`[${new Date().toISOString()}] OpenAI session.update sent (reply enabled)`);
+    console.log(`[${nowIso()}] OpenAI session.update sent (reply enabled)`);
   });
 
   // Twilio -> OpenAI audio + MARK acks
@@ -571,7 +608,7 @@ wss.on("connection", (twilioWs, req) => {
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || null;
       console.log(
-        `[${new Date().toISOString()}] Twilio start streamSid=${streamSid} callSid=${msg.start?.callSid}`
+        `[${nowIso()}] Twilio start streamSid=${streamSid} callSid=${msg.start?.callSid}`
       );
 
       const now = Date.now();
@@ -589,20 +626,16 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     if (msg.event === "media") {
-      // FIX: block inbound while Tessa is speaking
-      if (isSpeaking) return;
       safeOpenAI({ type: "input_audio_buffer.append", audio: msg.media.payload });
       return;
     }
 
     if (msg.event === "mark") {
       const name = msg.mark?.name || "";
-      console.log(`[${new Date().toISOString()}] Twilio MARK received name=${name}`);
+      console.log(`[${nowIso()}] Twilio MARK received name=${name}`);
 
       if (pendingHangupMarkName && name === pendingHangupMarkName) {
-        console.log(
-          `[${new Date().toISOString()}] Hangup MARK matched -> starting hangup countdown`
-        );
+        console.log(`[${nowIso()}] Hangup MARK matched -> starting hangup countdown`);
         cleanupHangupMark("mark_ack");
         startHangupCountdown("token_seen_mark_ack");
       }
@@ -610,7 +643,7 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     if (msg.event === "stop") {
-      console.log(`[${new Date().toISOString()}] Twilio stop streamSid=${streamSid}`);
+      console.log(`[${nowIso()}] Twilio stop streamSid=${streamSid}`);
       disarmHangup("twilio_stop");
       cancelSpeech("twilio_stop");
       if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
@@ -619,22 +652,25 @@ wss.on("connection", (twilioWs, req) => {
   });
 
   // OpenAI -> speak assistant text
-  let assistantBuf = "";
+  // FIX: speak only on response.done (never on transcript.done/text.done)
+  let assistantBuf = ""; // from response.audio_transcript.delta
   let assistantSeen = false;
 
-  let textBuf = "";
+  let textBuf = ""; // from response.text.delta (if present)
   let textSeen = false;
 
+  // Anti-double dedupe
   let lastSpokenHash = "";
   let lastSpokenAt = 0;
   const DEDUPE_WINDOW_MS = 5000;
 
-  let spokenForThisTurn = false;
+  // Guard per response
+  let spokenForThisResponse = false;
 
   function maybeSpeakFromBuffers(trigger) {
-    if (spokenForThisTurn) return;
+    if (spokenForThisResponse) return;
 
-    const combined = (assistantBuf.trim() || textBuf.trim()).trim();
+    const combined = (textBuf.trim() || assistantBuf.trim()).trim();
     if (!combined) return;
 
     const now = Date.now();
@@ -645,15 +681,20 @@ wss.on("connection", (twilioWs, req) => {
     lastSpokenHash = h;
     lastSpokenAt = now;
 
-    spokenForThisTurn = true;
+    spokenForThisResponse = true;
 
+    // speak first, reset buffers after scheduling speak
+    speak(combined).catch(() => {});
+    console.log(`[${nowIso()}] SPEAK_TRIGGERED via=${trigger}`);
+  }
+
+  function resetAssistantBuffers(reason) {
     assistantBuf = "";
     assistantSeen = false;
     textBuf = "";
     textSeen = false;
-
-    speak(combined).catch(() => {});
-    console.log(`[${new Date().toISOString()}] SPEAK_TRIGGERED via=${trigger}`);
+    spokenForThisResponse = false;
+    if (reason) console.log(`[${nowIso()}] ASSISTANT_RESET reason=${reason}`);
   }
 
   openaiWs.on("message", async (raw) => {
@@ -664,33 +705,34 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
+    // lightweight event logger (you already use this)
     if (evt?.type) {
-      console.log(`[${new Date().toISOString()}] OPENAI_EVT type=${evt.type}`);
+      console.log(`[${nowIso()}] OPENAI_EVT type=${evt.type}`);
     }
 
     if (evt.type === "input_audio_buffer.speech_started") {
-      console.log(`[${new Date().toISOString()}] 🎙️ speech_started (barge-in)`);
+      console.log(`[${nowIso()}] 🎙️ speech_started (barge-in)`);
+
+      // FIX #1: cancel any in-flight OpenAI response so it cannot "resume later"
+      safeOpenAI({ type: "response.cancel" });
+
       disarmHangup("barge_in");
       speechToken++;
       cancelSpeech("barge_in");
       twilioClear();
 
-      spokenForThisTurn = false;
-      assistantBuf = "";
-      assistantSeen = false;
-      textBuf = "";
-      textSeen = false;
-
+      // new user turn begins
+      resetAssistantBuffers("barge_in");
       return;
     }
 
     if (evt.type === "input_audio_buffer.speech_stopped") {
-      console.log(`[${new Date().toISOString()}] 🎙️ speech_stopped`);
+      console.log(`[${nowIso()}] 🎙️ speech_stopped`);
       return;
     }
 
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
-      console.log(`[${new Date().toISOString()}] 📝 USER SAID: "${evt.transcript}"`);
+      console.log(`[${nowIso()}] 📝 USER SAID: "${evt.transcript}"`);
       return;
     }
 
@@ -706,50 +748,48 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
-    if (evt.type === "response.audio_transcript.done") {
-      if (!assistantSeen && !textSeen) return;
-      // we prefer to wait for response.done (later), but keep behavior: allow trigger here
-      maybeSpeakFromBuffers("audio_transcript.done");
-      return;
-    }
-
-    if (evt.type === "response.text.done") {
-      if (!assistantSeen && !textSeen) return;
-      maybeSpeakFromBuffers("text.done");
-      return;
-    }
-
+    // FIX #2: speak only when the entire response is done
     if (evt.type === "response.done") {
-      if (!assistantSeen && !textSeen) return;
+      if (!assistantSeen && !textSeen) {
+        resetAssistantBuffers("response_done_empty");
+        return;
+      }
       maybeSpeakFromBuffers("response.done");
+
+      // FIX #3: reset buffers here (not on transcript.done)
+      resetAssistantBuffers("response_done");
       return;
     }
 
     if (evt.type === "error") {
-      console.error(`[${new Date().toISOString()}] ❌ OpenAI error:`, JSON.stringify(evt.error));
+      console.error(`[${nowIso()}] ❌ OpenAI error:`, JSON.stringify(evt.error));
     }
   });
 
   openaiWs.on("close", (code) => {
-    console.log(`[${new Date().toISOString()}] OpenAI WS closed code=${code}`);
+    console.log(`[${nowIso()}] OpenAI WS closed code=${code}`);
     disarmHangup("openai_ws_close");
     cancelSpeech("openai_ws_close");
     if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
   });
 
   openaiWs.on("error", (e) => {
-    console.error(`[${new Date().toISOString()}] OpenAI WS error:`, e.message);
+    console.error(`[${nowIso()}] OpenAI WS error:`, e.message);
   });
 
   twilioWs.on("close", () => {
-    console.log(`[${new Date().toISOString()}] Twilio WS closed streamSid=${streamSid}`);
+    console.log(`[${nowIso()}] Twilio WS closed streamSid=${streamSid}`);
+
+    // call summary
+    // (optional) you can keep call-level counters too, but we keep per-speak summary already
+
     disarmHangup("twilio_ws_close");
     cancelSpeech("twilio_ws_close");
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
 
   twilioWs.on("error", (e) => {
-    console.error(`[${new Date().toISOString()}] Twilio WS error:`, e.message);
+    console.error(`[${nowIso()}] Twilio WS error:`, e.message);
     disarmHangup("twilio_ws_error");
     cancelSpeech("twilio_ws_error");
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
@@ -761,7 +801,7 @@ wss.on("connection", (twilioWs, req) => {
 ======================= */
 httpServer.listen(PORT, () => {
   console.log(
-    `✅ DES inbound live on ${PORT} (Eleven greeting mp3-cache + Stream fallback + OpenAI reply + barge-in + anti-double + hangup-token)`
+    `✅ DES inbound live on ${PORT} (greeting mp3-cache + Stream fallback + OpenAI realtime + barge-in + response.cancel + speak-on-response.done + hangup-token)`
   );
   warmGreetingCache().catch(() => {});
 });
