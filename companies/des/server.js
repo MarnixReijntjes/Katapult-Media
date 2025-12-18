@@ -456,8 +456,17 @@ wss.on("connection", (twilioWs, req) => {
     const abortController = new AbortController();
     currentSpeech = { token: myToken, abortController };
 
+    // ✅ CHANGE: log full-length + tail (instead of first 140 chars only)
+    const tLen = t.length;
+    const tHash = sha1(t);
+    const tailLen = 80;
+    const tTail = t.slice(Math.max(0, tLen - tailLen));
+    const hasToken = t.includes(HANGUP_TOKEN);
+
     const t0 = Date.now();
-    console.log(`[${new Date().toISOString()}] SPEAK_START text="${t.slice(0, 140)}"`);
+    console.log(
+      `[${new Date().toISOString()}] SPEAK_START chars=${tLen} sha1=${tHash} hasToken=${hasToken} tail="${tTail}"`
+    );
 
     try {
       await elevenStreamToUlaw(
@@ -472,9 +481,11 @@ wss.on("connection", (twilioWs, req) => {
 
       if (speechToken !== myToken) return;
 
-      console.log(`[${new Date().toISOString()}] SPEAK_DONE ms=${Date.now() - t0}`);
+      console.log(
+        `[${new Date().toISOString()}] SPEAK_DONE ms=${Date.now() - t0} chars=${tLen} sha1=${tHash} hasToken=${hasToken}`
+      );
 
-      if (t.includes(HANGUP_TOKEN)) {
+      if (hasToken) {
         armHangup("token_seen");
       }
     } catch (e) {
@@ -581,7 +592,6 @@ wss.on("connection", (twilioWs, req) => {
   });
 
   // OpenAI -> speak assistant text
-  // CHANGE: also support response.text.* because audio_transcript.* can be incomplete
   let assistantBuf = "";
   let assistantSeen = false;
 
@@ -592,7 +602,6 @@ wss.on("connection", (twilioWs, req) => {
   let lastSpokenAt = 0;
   const DEDUPE_WINDOW_MS = 5000;
 
-  // Guard to prevent speaking twice on both done events
   let spokenForThisTurn = false;
 
   function maybeSpeakFromBuffers(trigger) {
@@ -611,7 +620,6 @@ wss.on("connection", (twilioWs, req) => {
 
     spokenForThisTurn = true;
 
-    // reset buffers for next turn
     assistantBuf = "";
     assistantSeen = false;
     textBuf = "";
@@ -636,7 +644,6 @@ wss.on("connection", (twilioWs, req) => {
       cancelSpeech("barge_in");
       twilioClear();
 
-      // new user turn begins: allow next assistant speak
       spokenForThisTurn = false;
       assistantBuf = "";
       assistantSeen = false;
