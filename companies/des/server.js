@@ -24,6 +24,10 @@ const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL || "eleven_multilingual_v2";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
+// ✅ Hangup config (was missing in your current file)
+const HANGUP_TOKEN = process.env.HANGUP_TOKEN || "AFRONDEN_OK";
+const HANGUP_DELAY_MS = Number(process.env.HANGUP_DELAY_MS || 2500);
+
 if (!OPENAI_API_KEY) {
   console.error("❌ OPENAI_API_KEY missing");
   process.exit(1);
@@ -317,6 +321,7 @@ const httpServer = http.createServer(async (req, res) => {
    - barge-in
    - anti-double: speak only on response.audio_transcript.done
    - NEW: if TwiML was stream-only (no mp3 cache), we speak greeting via WS on start.
+   - ✅ FIX: hangup token handling (MARK-gated + delay + fallback)
 ========================= */
 const wss = new WebSocketServer({ server: httpServer });
 
@@ -368,6 +373,98 @@ wss.on("connection", (twilioWs, req) => {
     twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
   }
 
+  // ===== Hangup state (MARK-gated) =====
+  let hangupTimer = null;
+  let pendingHangupMarkName = null;
+  let hangupFailSafeTimer = null;
+  let markSeq = 0;
+
+  function cleanupHangupMark(reason) {
+    pendingHangupMarkName = null;
+    if (hangupFailSafeTimer) {
+      clearTimeout(hangupFailSafeTimer);
+      hangupFailSafeTimer = null;
+    }
+    if (reason) {
+      console.log(`[${new Date().toISOString()}] Hangup mark cleared reason=${reason}`);
+    }
+  }
+
+  function startHangupCountdown(reason) {
+    if (hangupTimer) clearTimeout(hangupTimer);
+    hangupTimer = setTimeout(() => {
+      console.log(`[${new Date().toISOString()}] Hanging up reason=${reason}`);
+      try {
+        twilioWs.close();
+      } catch {}
+    }, HANGUP_DELAY_MS);
+
+    console.log(
+      `[${new Date().toISOString()}] Hangup armed in ${HANGUP_DELAY_MS}ms reason=${reason}`
+    );
+  }
+
+  function sendMark(name) {
+    if (twilioWs.readyState !== WebSocket.OPEN || !streamSid) return false;
+    try {
+      twilioWs.send(
+        JSON.stringify({
+          event: "mark",
+          streamSid,
+          mark: { name },
+        })
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function armHangup(reason) {
+    // cancel any existing hangup
+    if (hangupTimer) {
+      clearTimeout(hangupTimer);
+      hangupTimer = null;
+    }
+    cleanupHangupMark("rearm");
+
+    const name = `hangup_${Date.now()}_${++markSeq}`;
+    const ok = sendMark(name);
+
+    if (ok) {
+      pendingHangupMarkName = name;
+      console.log(
+        `[${new Date().toISOString()}] Hangup armed via MARK name=${name} reason=${reason}`
+      );
+
+      // Fail-safe: fallback to old behavior if no MARK ack
+      const FAILSAFE_MS = Math.max(8000, HANGUP_DELAY_MS + 3000);
+      hangupFailSafeTimer = setTimeout(() => {
+        console.log(
+          `[${new Date().toISOString()}] Hangup MARK timeout -> fallback name=${name} reason=${reason}`
+        );
+        cleanupHangupMark("mark_timeout");
+        startHangupCountdown("token_seen_fallback");
+      }, FAILSAFE_MS);
+    } else {
+      console.log(
+        `[${new Date().toISOString()}] Hangup mark send failed -> fallback reason=${reason}`
+      );
+      cleanupHangupMark("mark_send_failed");
+      startHangupCountdown("token_seen_fallback_send_failed");
+    }
+  }
+
+  function disarmHangup(reason) {
+    if (hangupTimer) {
+      clearTimeout(hangupTimer);
+      hangupTimer = null;
+    }
+    cleanupHangupMark(reason);
+    console.log(`[${new Date().toISOString()}] Hangup disarmed reason=${reason}`);
+  }
+  // ===== END hangup state =====
+
   async function speak(text) {
     const t = (text || "").trim();
     if (!t) return;
@@ -395,6 +492,11 @@ wss.on("connection", (twilioWs, req) => {
       if (speechToken !== myToken) return;
 
       console.log(`[${new Date().toISOString()}] SPEAK_DONE ms=${Date.now() - t0}`);
+
+      // ✅ If assistant ended with token, hang up (after mark ack + delay)
+      if (t.includes(HANGUP_TOKEN)) {
+        armHangup("token_seen");
+      }
     } catch (e) {
       if (abortController.signal.aborted) return;
       console.error("❌ SPEAK_ERROR:", e.message);
@@ -441,7 +543,7 @@ wss.on("connection", (twilioWs, req) => {
     console.log(`[${new Date().toISOString()}] OpenAI session.update sent (reply enabled)`);
   });
 
-  // Twilio -> OpenAI audio
+  // Twilio -> OpenAI audio + MARK acks
   twilioWs.on("message", (buf) => {
     let msg;
     try {
@@ -476,8 +578,23 @@ wss.on("connection", (twilioWs, req) => {
       return;
     }
 
+    if (msg.event === "mark") {
+      const name = msg.mark?.name || "";
+      console.log(`[${new Date().toISOString()}] Twilio MARK received name=${name}`);
+
+      if (pendingHangupMarkName && name === pendingHangupMarkName) {
+        console.log(
+          `[${new Date().toISOString()}] Hangup MARK matched -> starting hangup countdown`
+        );
+        cleanupHangupMark("mark_ack");
+        startHangupCountdown("token_seen_mark_ack");
+      }
+      return;
+    }
+
     if (msg.event === "stop") {
       console.log(`[${new Date().toISOString()}] Twilio stop streamSid=${streamSid}`);
+      disarmHangup("twilio_stop");
       cancelSpeech("twilio_stop");
       if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
       return;
@@ -503,6 +620,7 @@ wss.on("connection", (twilioWs, req) => {
 
     if (evt.type === "input_audio_buffer.speech_started") {
       console.log(`[${new Date().toISOString()}] 🎙️ speech_started (barge-in)`);
+      disarmHangup("barge_in");
       speechToken++;
       cancelSpeech("barge_in");
       twilioClear();
@@ -552,6 +670,7 @@ wss.on("connection", (twilioWs, req) => {
 
   openaiWs.on("close", (code) => {
     console.log(`[${new Date().toISOString()}] OpenAI WS closed code=${code}`);
+    disarmHangup("openai_ws_close");
     cancelSpeech("openai_ws_close");
     if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
   });
@@ -562,12 +681,14 @@ wss.on("connection", (twilioWs, req) => {
 
   twilioWs.on("close", () => {
     console.log(`[${new Date().toISOString()}] Twilio WS closed streamSid=${streamSid}`);
+    disarmHangup("twilio_ws_close");
     cancelSpeech("twilio_ws_close");
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
 
   twilioWs.on("error", (e) => {
     console.error(`[${new Date().toISOString()}] Twilio WS error:`, e.message);
+    disarmHangup("twilio_ws_error");
     cancelSpeech("twilio_ws_error");
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
   });
@@ -578,7 +699,7 @@ wss.on("connection", (twilioWs, req) => {
 ======================= */
 httpServer.listen(PORT, () => {
   console.log(
-    `✅ DES inbound live on ${PORT} (Eleven greeting mp3-cache + Stream fallback + OpenAI reply + barge-in + anti-double)`
+    `✅ DES inbound live on ${PORT} (Eleven greeting mp3-cache + Stream fallback + OpenAI reply + barge-in + anti-double + hangup-token)`
   );
   // Warm immediately so first inbound call answers fast.
   warmGreetingCache().catch(() => {});
